@@ -15,14 +15,14 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ===================== CONFIG =====================
-BOT_TOKEN = (os.getenv("8381505129:AAG0X7jwRHUScfwFrsxi5C5QTwGuwfn3RIE") or "").strip()
-GROUP_ID_RAW = (os.getenv("-1001877019294") or "").strip()
+BOT_TOKEN = (os.getenv(8381505129:AAG0X7jwRHUScfwFrsxi5C5QTwGuwfn3RIE) or "").strip()
+GROUP_ID_RAW = (os.getenv(-1001877019294) or "").strip()
 
 # optional
-TEST_MODE = (os.getenv("1") or "0").strip() == "1"
-ADMIN_IDS_RAW = (os.getenv("1432810519") or "").strip()  # "123,456"
-DB_PATH = (os.getenv("complaints.sqlite3") or "complaints.sqlite3").strip()
-TZ_NAME = (os.getenv("TZ") or "Asia/Tashkent").strip()
+TEST_MODE = (os.getenv(1) or "0").strip() == "1"
+ADMIN_IDS_RAW = (os.getenv(1432810519) or "").strip()  # "123,456"
+DB_PATH = (os.getenv(complaints.sqlite3) or "complaints.sqlite3").strip()
+TZ_NAME = (os.getenv(TZ) or "Asia/Tashkent").strip()
 
 # employees list (buttons)
 EMPLOYEES = [
