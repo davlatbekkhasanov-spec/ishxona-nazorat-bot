@@ -1,11 +1,12 @@
 import os
+import re
 import asyncio
 import logging
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
@@ -14,17 +15,15 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# ===================== CONFIG =====================
-BOT_TOKEN = (os.getenv(8381505129:AAG0X7jwRHUScfwFrsxi5C5QTwGuwfn3RIE) or "").strip()
-GROUP_ID_RAW = (os.getenv(-1001877019294) or "").strip()
 
-# optional
-TEST_MODE = (os.getenv(1) or "0").strip() == "1"
-ADMIN_IDS_RAW = (os.getenv(1432810519) or "").strip()  # "123,456"
-DB_PATH = (os.getenv(complaints.sqlite3) or "complaints.sqlite3").strip()
-TZ_NAME = (os.getenv(TZ) or "Asia/Tashkent").strip()
+# ------------------ CONFIG (env) ------------------
+BOT_TOKEN = os.getenv("8381505129:AAG0X7jwRHUScfwFrsxi5C5QTwGuwfn3RIE", "").strip()
+GROUP_ID_RAW = os.getenv("-1001877019294", "").strip()
+TEST_MODE = os.getenv("0", "0").strip() == "1"
+ADMIN_IDS_RAW = os.getenv("1432810519", "").strip()
+DB_PATH = os.getenv("complaints.sqlite3", "complaints.sqlite3").strip()
+TZ_NAME = os.getenv("TZ", "Asia/Tashkent").strip()
 
-# employees list (buttons)
 EMPLOYEES = [
     "Сагдуллаев Юнус",
     "Самадов Тулкин",
@@ -38,19 +37,16 @@ EMPLOYEES = [
     "Равшанов Охунжон",
 ]
 
-# ===================== VALIDATION =====================
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing in env variables (Railway Variables).")
-
+    raise RuntimeError("BOT_TOKEN is empty. Set Railway variable BOT_TOKEN.")
 if not GROUP_ID_RAW:
-    raise RuntimeError("GROUP_ID is missing in env variables (Railway Variables).")
-
+    raise RuntimeError("GROUP_ID is empty. Set Railway variable GROUP_ID.")
 try:
     GROUP_ID = int(GROUP_ID_RAW)
 except Exception as e:
     raise RuntimeError(f"GROUP_ID must be integer, got: {GROUP_ID_RAW!r}") from e
 
-ADMIN_IDS = set()
+ADMIN_IDS: set[int] = set()
 if ADMIN_IDS_RAW:
     for x in ADMIN_IDS_RAW.split(","):
         x = x.strip()
@@ -59,178 +55,134 @@ if ADMIN_IDS_RAW:
 
 TZ = ZoneInfo(TZ_NAME)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-log = logging.getLogger("nazorat-bot")
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("nazorat")
 
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-)
+
+# ------------------ BOT / ROUTER / SCHED ------------------
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
-
+router = Router()
 scheduler = AsyncIOScheduler(timezone=TZ)
 
+PENDING: dict[int, str] = {}  # user_id -> chosen employee
 
-# ===================== DB =====================
+
+# ------------------ DB ------------------
 def db_conn():
-    return sqlite3.connect(DB_PATH)
-
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
 
 def db_init():
     with db_conn() as con:
-        con.execute(
-            """
+        con.execute("""
             CREATE TABLE IF NOT EXISTS complaints(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL,
                 month_key TEXT NOT NULL,
                 from_user_id INTEGER NOT NULL,
-                from_user_name TEXT,
                 from_username TEXT,
+                from_fullname TEXT,
                 employee TEXT NOT NULL,
                 text TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'open',
                 decided_at TEXT,
                 decided_by INTEGER
             )
-            """
-        )
-        con.execute(
-            "CREATE INDEX IF NOT EXISTS idx_compl_month ON complaints(month_key)"
-        )
-        con.execute(
-            "CREATE INDEX IF NOT EXISTS idx_compl_status ON complaints(status)"
-        )
-
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_compl_month ON complaints(month_key)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_compl_status ON complaints(status)")
 
 def month_key_for(dt: datetime) -> str:
-    """
-    Rule: new month cycle starts every 2nd day.
-    Example: Feb 1 -> belongs to previous month cycle (Jan)
-             Feb 2+ -> belongs to Feb
-    """
-    if dt.day < 2:
-        prev = (dt.replace(day=1) - timedelta(days=1))
-        return prev.strftime("%Y-%m")
-    return dt.strftime("%Y-%m")
+    if dt.day >= 2:
+        return dt.strftime("%Y-%m")
+    prev = (dt.replace(day=1) - timedelta(days=1))
+    return prev.strftime("%Y-%m")
 
-
-def db_add_complaint(user: Message, employee: str, text: str) -> int:
+def add_complaint(m: Message, employee: str, text: str) -> int:
     now = datetime.now(TZ)
     mk = month_key_for(now)
     with db_conn() as con:
-        cur = con.execute(
-            """
-            INSERT INTO complaints(created_at, month_key, from_user_id, from_user_name, from_username, employee, text, status)
+        cur = con.execute("""
+            INSERT INTO complaints(created_at, month_key, from_user_id, from_username, from_fullname, employee, text, status)
             VALUES(?,?,?,?,?,?,?, 'open')
-            """,
-            (
-                now.isoformat(),
-                mk,
-                user.from_user.id,
-                user.from_user.full_name if user.from_user else None,
-                user.from_user.username if user.from_user else None,
-                employee,
-                text,
-            ),
-        )
+        """, (
+            now.isoformat(),
+            mk,
+            m.from_user.id,
+            (m.from_user.username if m.from_user else None),
+            (m.from_user.full_name if m.from_user else None),
+            employee,
+            text,
+        ))
+        con.commit()
         return int(cur.lastrowid)
 
-
-def db_set_status(complaint_id: int, status: str, decided_by: int):
+def set_status(complaint_id: int, status: str, decided_by: int) -> bool:
     now = datetime.now(TZ)
     with db_conn() as con:
-        con.execute(
-            """
+        row = con.execute("SELECT status FROM complaints WHERE id=?", (complaint_id,)).fetchone()
+        if not row:
+            return False
+        if row["status"] != "open":
+            return False
+        con.execute("""
             UPDATE complaints
             SET status=?, decided_at=?, decided_by=?
             WHERE id=?
-            """,
-            (status, now.isoformat(), decided_by, complaint_id),
-        )
+        """, (status, now.isoformat(), decided_by, complaint_id))
+        con.commit()
+        return True
 
-
-def db_stats_for_day(day: datetime) -> dict:
-    mk = month_key_for(day)
-    start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+def today_stats() -> dict:
+    now = datetime.now(TZ)
+    start = datetime.combine(now.date(), dtime(0, 0), tzinfo=TZ)
     end = start + timedelta(days=1)
+    mk = month_key_for(now)
+
     with db_conn() as con:
-        total = con.execute(
-            """
-            SELECT COUNT(*) FROM complaints
+        total_today = int(con.execute("""
+            SELECT COUNT(*) AS c FROM complaints
             WHERE created_at >= ? AND created_at < ?
-            """,
-            (start.isoformat(), end.isoformat()),
-        ).fetchone()[0]
+        """, (start.isoformat(), end.isoformat())).fetchone()["c"])
 
-        open_cnt = con.execute(
-            """
-            SELECT COUNT(*) FROM complaints
-            WHERE status='open'
-            """,
-        ).fetchone()[0]
-
-        done = con.execute(
-            """
-            SELECT COUNT(*) FROM complaints
+        done_today = int(con.execute("""
+            SELECT COUNT(*) AS c FROM complaints
             WHERE created_at >= ? AND created_at < ? AND status='done'
-            """,
-            (start.isoformat(), end.isoformat()),
-        ).fetchone()[0]
+        """, (start.isoformat(), end.isoformat())).fetchone()["c"])
 
-        rejected = con.execute(
-            """
-            SELECT COUNT(*) FROM complaints
+        rejected_today = int(con.execute("""
+            SELECT COUNT(*) AS c FROM complaints
             WHERE created_at >= ? AND created_at < ? AND status='rejected'
-            """,
-            (start.isoformat(), end.isoformat()),
-        ).fetchone()[0]
+        """, (start.isoformat(), end.isoformat())).fetchone()["c"])
 
-        month_total = con.execute(
-            """
-            SELECT COUNT(*) FROM complaints
-            WHERE month_key=?
-            """,
-            (mk,),
-        ).fetchone()[0]
+        open_now = int(con.execute("""
+            SELECT COUNT(*) AS c FROM complaints WHERE status='open'
+        """).fetchone()["c"])
 
-        return {
-            "date": start.strftime("%Y-%m-%d"),
-            "month_key": mk,
-            "total_today": total,
-            "done_today": done,
-            "rejected_today": rejected,
-            "open_now": open_cnt,
-            "month_total": month_total,
-        }
+        month_total = int(con.execute("""
+            SELECT COUNT(*) AS c FROM complaints WHERE month_key=?
+        """, (mk,)).fetchone()["c"])
+
+    return {
+        "date": now.strftime("%Y-%m-%d"),
+        "month_key": mk,
+        "total_today": total_today,
+        "done_today": done_today,
+        "rejected_today": rejected_today,
+        "open_now": open_now,
+        "month_total": month_total,
+    }
 
 
-def db_month_employee_counts(mk: str) -> list[tuple[str, int]]:
-    with db_conn() as con:
-        rows = con.execute(
-            """
-            SELECT employee, COUNT(*) as c
-            FROM complaints
-            WHERE month_key=?
-            GROUP BY employee
-            ORDER BY c DESC, employee ASC
-            """,
-            (mk,),
-        ).fetchall()
-        return [(r[0], int(r[1])) for r in rows]
-
-
-# ===================== KEYBOARDS =====================
+# ------------------ KEYBOARDS ------------------
 def kb_employees():
     b = InlineKeyboardBuilder()
     for name in EMPLOYEES:
         b.button(text=name, callback_data=f"emp:{name}")
-    b.adjust(2)  # 2 per row
+    b.adjust(2)
     return b.as_markup()
-
 
 def kb_decision(complaint_id: int):
     b = InlineKeyboardBuilder()
@@ -240,209 +192,172 @@ def kb_decision(complaint_id: int):
     return b.as_markup()
 
 
-# ===================== STATE (simple memory) =====================
-# user_id -> {"employee": str}
-PENDING = {}
-
-
-# ===================== COMMANDS =====================
-@dp.message(Command("start"))
-async def cmd_start(m: Message):
-    txt = (
-        "👋 Салом! Бу <b>Nazorat</b> боти.\n\n"
-        "Шикоят қолдириш учун: /complaint\n"
-        "ID чиқариш: /myid\n"
-        "Статистика: /stats\n"
+# ------------------ HANDLERS ------------------
+@router.message(Command("start"))
+async def start_cmd(m: Message):
+    if m.chat.type != "private":
+        await m.answer("✅ Nazorat bot ишлаяпти.")
+        return
+    await m.answer(
+        "Салом! 👋\n\n"
+        "Жалоба ёзиш:\n"
+        "1) /complaint\n"
+        "2) ходимни танлайсиз\n"
+        "3) тавсифни ёзасиз\n\n"
+        "Командалар: /myid, /stats"
+        + ("\n\n🧪 TEST MODE ON" if TEST_MODE else "")
     )
-    if TEST_MODE:
-        txt += "\n🧪 <b>TEST MODE ON</b>"
-    await m.answer(txt)
 
-
-@dp.message(Command("myid"))
-async def cmd_myid(m: Message):
+@router.message(Command("myid"))
+async def myid_cmd(m: Message):
     await m.answer(f"🆔 Сизнинг ID: <code>{m.from_user.id}</code>")
 
+@router.message(Command("complaint"))
+async def complaint_cmd(m: Message):
+    if m.chat.type != "private":
+        return
+    PENDING[m.from_user.id] = ""
+    await m.answer("Ким ҳақида жалоба? Танланг:", reply_markup=kb_employees())
 
-@dp.message(Command("complaint"))
-async def cmd_complaint(m: Message):
-    PENDING[m.from_user.id] = {"employee": None}
-    await m.answer("Ким ҳақида шикоят? Танланг:", reply_markup=kb_employees())
+@router.message(Command("stats"))
+async def stats_cmd(m: Message):
+    if ADMIN_IDS and (m.from_user.id not in ADMIN_IDS):
+        await m.answer("⛔ Бу команда фақат админ учун.")
+        return
+    st = today_stats()
+    await m.answer(
+        f"📊 <b>Статистика</b>\n"
+        f"Сана: <b>{st['date']}</b>\n"
+        f"Ой цикли: <b>{st['month_key']}</b> (2-санадан)\n\n"
+        f"Бугун жами: <b>{st['total_today']}</b>\n"
+        f"✅ Бартараф: <b>{st['done_today']}</b>\n"
+        f"❌ Рад: <b>{st['rejected_today']}</b>\n"
+        f"⏳ Очиқ: <b>{st['open_now']}</b>\n"
+        f"📌 Ой бўйича жами: <b>{st['month_total']}</b>"
+    )
 
-
-@dp.message(Command("stats"))
-async def cmd_stats(m: Message):
-    now = datetime.now(TZ)
-    st = db_stats_for_day(now)
-    mk = st["month_key"]
-    per_emp = db_month_employee_counts(mk)
-
-    lines = [
-        f"📊 <b>Статистика</b>",
-        f"Сана: <b>{st['date']}</b>",
-        f"Ой цикли: <b>{mk}</b> (2-санадан бошланади)",
-        "",
-        f"Бугунги шикоятлар: <b>{st['total_today']}</b>",
-        f"✅ Бартараф: <b>{st['done_today']}</b>",
-        f"❌ Рад: <b>{st['rejected_today']}</b>",
-        f"⏳ Ҳозир очиқ: <b>{st['open_now']}</b>",
-        "",
-        f"📌 Ой бўйича жами: <b>{st['month_total']}</b>",
-    ]
-    if per_emp:
-        lines.append("\n👥 <b>Ой бўйича кимга кўп тушган:</b>")
-        for name, c in per_emp[:10]:
-            lines.append(f"• {name}: <b>{c}</b>")
-    await m.answer("\n".join(lines))
-
-
-# ===================== CALLBACKS =====================
-@dp.callback_query(F.data.startswith("emp:"))
-async def cb_employee(c: CallbackQuery):
-    user_id = c.from_user.id
-    if user_id not in PENDING:
-        PENDING[user_id] = {"employee": None}
-
+@router.callback_query(F.data.startswith("emp:"))
+async def employee_cb(c: CallbackQuery):
+    if c.message.chat.type != "private":
+        await c.answer("Фақат личкада.", show_alert=True)
+        return
     employee = c.data.split("emp:", 1)[1]
-    PENDING[user_id]["employee"] = employee
-
+    PENDING[c.from_user.id] = employee
     await c.message.edit_text(
-        f"✅ Танланди: <b>{employee}</b>\n\nЭнди шикоятни матнда ёзинг (1 та хабарда)."
+        f"✅ Танланди: <b>{employee}</b>\n\nЭнди тавсифни матнда ёзинг (1 хабарда)."
     )
     await c.answer()
 
+@router.message(F.text)
+async def any_text(m: Message):
+    if m.chat.type != "private":
+        return
+    employee = PENDING.get(m.from_user.id)
+    if not employee:
+        return
 
-@dp.callback_query(F.data.startswith("dec:"))
-async def cb_decision(c: CallbackQuery):
-    # allow anyone in group to press (as you requested)
+    text = re.sub(r"\s+", " ", (m.text or "").strip())
+    if not text:
+        await m.answer("Матн бўш бўлмасин.")
+        return
+
+    cid = add_complaint(m, employee, text)
+    PENDING.pop(m.from_user.id, None)
+
+    uname = f"@{m.from_user.username}" if m.from_user.username else "—"
+    msg = (
+        f"🆕 <b>Янги жалоба</b>\n"
+        f"ID: <code>{cid}</code>\n"
+        f"Ходим: <b>{employee}</b>\n"
+        f"Юборган: <b>{m.from_user.full_name}</b> ({uname}) | <code>{m.from_user.id}</code>\n\n"
+        f"📝 <b>Тавсиф:</b>\n{text}"
+        + ("\n\n🧪 <b>TEST MODE</b>" if TEST_MODE else "")
+    )
+
+    await bot.send_message(GROUP_ID, msg, reply_markup=kb_decision(cid))
+    await m.answer("✅ Қабул қилинди. Раҳмат!")
+
+@router.callback_query(F.data.startswith("dec:"))
+async def decision_cb(c: CallbackQuery):
+    if ADMIN_IDS and (c.from_user.id not in ADMIN_IDS):
+        await c.answer("⛔ Фақат админ", show_alert=True)
+        return
+
     try:
-        _, status, cid = c.data.split(":")
-        complaint_id = int(cid)
+        _, status, cid_s = c.data.split(":")
+        cid = int(cid_s)
     except Exception:
         await c.answer("Хато кнопка", show_alert=True)
         return
 
-    if status not in ("done", "rejected"):
-        await c.answer("Нотўғри статус", show_alert=True)
+    ok = set_status(cid, status=status, decided_by=c.from_user.id)
+    if not ok:
+        await c.answer("Аллақачон ёпилган ёки топилмади.", show_alert=True)
         return
 
-    db_set_status(complaint_id, status=status, decided_by=c.from_user.id)
-
-    if status == "done":
-        mark = "✅ <b>Бартараф этилди</b>"
-    else:
-        mark = "❌ <b>Асосли эмас (рад)</b>"
-
-    # update message
     try:
         await c.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
 
-    await c.message.reply(
-        f"{mark}\n"
-        f"Қарор қилган: <code>{c.from_user.id}</code>\n"
-        f"ID: <code>{complaint_id}</code>"
-        + ("\n🧪 TEST" if TEST_MODE else "")
-    )
-    await c.answer("Қабул қилинди")
+    mark = "✅ Бартараф этилди" if status == "done" else "❌ Рад этилди"
+    await c.message.reply(f"{mark}\nЖалоба ID: <code>{cid}</code>")
+    await c.answer("OK")
 
 
-# ===================== MESSAGE HANDLER =====================
-@dp.message()
-async def any_message(m: Message):
-    # if user is writing complaint text after choosing employee
-    st = PENDING.get(m.from_user.id)
-    if not st or not st.get("employee"):
-        return
-
-    employee = st["employee"]
-    text = (m.text or "").strip()
-    if not text:
-        await m.answer("Фақат матн ёзинг.")
-        return
-
-    cid = db_add_complaint(m, employee, text)
-    PENDING.pop(m.from_user.id, None)
-
-    # send to group
-    uname = f"@{m.from_user.username}" if m.from_user.username else "—"
-    msg = (
-        f"🆕 <b>Янги шикоят</b>\n"
-        f"ID: <code>{cid}</code>\n"
-        f"Ходим: <b>{employee}</b>\n"
-        f"Юборган: <b>{m.from_user.full_name}</b> ({uname}) | <code>{m.from_user.id}</code>\n\n"
-        f"📝 <b>Тавсиф:</b>\n{text}"
-    )
-    if TEST_MODE:
-        msg += "\n\n🧪 <b>TEST MODE</b>"
-
-    await bot.send_message(GROUP_ID, msg, reply_markup=kb_decision(cid))
-    await m.answer("✅ Қабул қилинди. Раҳмат!" + (" 🧪 TEST" if TEST_MODE else ""))
-
-
-# ===================== SCHEDULED MESSAGES =====================
-def motivation_text(has_errors: bool, when: str) -> str:
+# ------------------ SCHEDULER ------------------
+def motivation(has_errors: bool, when_label: str) -> str:
     if has_errors:
         return (
-            f"⏰ <b>{when}</b>\n"
-            f"Бугун хатолар бор. Илтимос, диққатни оширинг ва хатони такрорламанг.\n"
-            f"Кучли жамоа — тартибли иш!"
-            + ("\n🧪 TEST" if TEST_MODE else "")
+            f"⚠️ <b>{when_label}</b>\n"
+            f"Бугун хатолар бор. Диққатни ошириб ишлаймиз.\n"
+            f"💪 Ҳар куни яхшироқ!"
         )
     return (
-        f"⏰ <b>{when}</b>\n"
-        f"Бугун хатолар йўқ! 👏\n"
-        f"Шу темпда давом этамиз — эртанги кунга ҳам шундай кайфият!"
-        + ("\n🧪 TEST" if TEST_MODE else "")
+        f"✅ <b>{when_label}</b>\n"
+        f"Бугун хатосиз! 👏\n"
+        f"🚀 Эртанги кунга ҳам шу темпда!"
     )
 
-
-async def send_daily_report(when: str):
-    now = datetime.now(TZ)
-    st = db_stats_for_day(now)
-    has_errors = st["total_today"] > 0
-    text = (
-        motivation_text(has_errors, when)
+async def send_report(when_label: str):
+    st = today_stats()
+    txt = (
+        motivation(st["total_today"] > 0, when_label)
         + "\n\n"
-        f"📌 Бугунги шикоятлар: <b>{st['total_today']}</b>\n"
+        f"📌 Бугунги жалобалар: <b>{st['total_today']}</b>\n"
         f"✅ Бартараф: <b>{st['done_today']}</b>\n"
         f"❌ Рад: <b>{st['rejected_today']}</b>\n"
         f"⏳ Очиқ: <b>{st['open_now']}</b>\n"
         f"🗓 Ой цикли ({st['month_key']}): <b>{st['month_total']}</b>"
+        + ("\n\n🧪 <b>TEST MODE</b>" if TEST_MODE else "")
     )
-    await bot.send_message(GROUP_ID, text)
+    await bot.send_message(GROUP_ID, txt)
 
-
-# ===================== STARTUP =====================
-async def on_startup():
-    db_init()
-    await bot.send_message(
-        GROUP_ID,
-        "✅ <b>Nazorat bot ishga tushdi</b>" + ("\n🧪 TEST MODE ON" if TEST_MODE else ""),
-    )
-
+async def test_ping():
+    await bot.send_message(GROUP_ID, "🟣 TEST: bot ishlayapti (2 soatlik ping).")
 
 def setup_jobs():
-    # 08:00 and 21:00 Tashkent time
-    scheduler.add_job(send_daily_report, "cron", hour=8, minute=0, args=["08:00"])
-    scheduler.add_job(send_daily_report, "cron", hour=21, minute=0, args=["21:00"])
-
-    # optional health ping every 2 hours (for monitoring)
-    scheduler.add_job(
-        lambda: bot.send_message(GROUP_ID, "✅ Bot alive (2h ping)" + (" 🧪" if TEST_MODE else "")),
-        "interval",
-        hours=2,
-        next_run_time=datetime.now(TZ) + timedelta(minutes=2),
-    )
+    scheduler.add_job(lambda: asyncio.create_task(send_report("08:00")), "cron", hour=8, minute=0)
+    scheduler.add_job(lambda: asyncio.create_task(send_report("21:00")), "cron", hour=21, minute=0)
+    if TEST_MODE:
+        scheduler.add_job(lambda: asyncio.create_task(test_ping()), "interval", hours=2)
 
 
+# ------------------ MAIN ------------------
 async def main():
-    await on_startup()
+    db_init()
+    await bot.delete_webhook(drop_pending_updates=True)  # important for polling mode
+    dp.include_router(router)
+
     setup_jobs()
     scheduler.start()
-    await dp.start_polling(bot)
 
+    try:
+        await bot.send_message(GROUP_ID, "✅ <b>Nazorat bot ишга тушди</b>" + ("\n🧪 TEST MODE ON" if TEST_MODE else ""))
+    except Exception as e:
+        log.warning("Startup message failed: %s", e)
+
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
