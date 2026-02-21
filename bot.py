@@ -1,108 +1,85 @@
 import os
 import re
+import sys
 import asyncio
 import logging
 import sqlite3
-import sys
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    BotCommand,
+    BotCommandScopeDefault,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-
 # ===================== CONFIG (ENV) =====================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8381505129:AAG0X7jwRHUScfwFrsxi5C5QTwGuwfn3RIE").strip()
-GROUP_ID_RAW = os.getenv("GROUP_ID", "-1001877019294").strip()
-ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "1432810519").strip()
 
-TEST_MODE = os.getenv("TEST_MODE", "0").strip() == "1"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8381505129:AAG0X7jwRHUScfwFrsxi5C5QTwGuwfn3RIE").strip()
+GROUP_ID_RAW = os.getenv("GROUP_ID", "-1001877019294").strip()          # optional: -100....
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "1432810519").strip()        # example: "1432810519,123456789"
 DB_PATH = os.getenv("DB_PATH", "complaints.sqlite3").strip()
 TZ_NAME = os.getenv("TZ", "Asia/Tashkent").strip()
 
-ALERT_THRESHOLD = int((os.getenv("ALERT_THRESHOLD", "3").strip() or "3"))
+TEST_MODE = os.getenv("TEST_MODE", "0").strip() == "1"    # optional
+RESET_CODE = os.getenv("RESET_CODE", "BRON-RESET-2026").strip()
 
+TZ = ZoneInfo(TZ_NAME)
+
+# !!! EMPLOYEES ni o'zingniki bilan qoldir / to'ldir
 EMPLOYEES = [
     "Сагдуллаев Юнус",
     "Самадов Тулкин",
     "Тохиров Муслимбек",
     "Мустафоев Абдулло",
-    "Ражаббоев Пулат",
-    "Рузибоев Сардор",
-    "Собиров Самандар",
-    "Равшанов Зиёдулло",
-    "Шерназаров Толиб",
-    "Равшанов Охунжон",
+    "Рахабоев Пулат",
 ]
+
+def parse_admin_ids(raw: str) -> set[int]:
+    ids = set()
+    if not raw:
+        return ids
+    for part in re.split(r"[,\s;]+", raw):
+        part = part.strip()
+        if part.isdigit():
+            ids.add(int(part))
+    return ids
+
+ADMIN_IDS = parse_admin_ids(ADMIN_IDS_RAW)
+
+def parse_group_id(raw: str) -> int | None:
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+GROUP_ID = parse_group_id(GROUP_ID_RAW)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is empty. Set Railway variable BOT_TOKEN.")
-if not GROUP_ID_RAW:
-    raise RuntimeError("GROUP_ID is empty. Set Railway variable GROUP_ID.")
-try:
-    GROUP_ID = int(GROUP_ID_RAW)
-except Exception as e:
-    raise RuntimeError(f"GROUP_ID must be integer, got: {GROUP_ID_RAW!r}") from e
-
-ADMIN_IDS: set[int] = set()
-if not ADMIN_IDS_RAW:
-    raise RuntimeError("ADMIN_IDS is empty. Set Railway variable ADMIN_IDS to your Telegram ID.")
-for x in ADMIN_IDS_RAW.split(","):
-    x = x.strip()
-    if x.isdigit():
-        ADMIN_IDS.add(int(x))
 if not ADMIN_IDS:
-    raise RuntimeError("ADMIN_IDS parsed empty. Example: ADMIN_IDS=123456789")
+    raise RuntimeError("ADMIN_IDS is empty. Set Railway variable ADMIN_IDS (comma separated user IDs).")
 
-TZ = ZoneInfo(TZ_NAME)
+# ===================== LOGGING =====================
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("nazorat")
-
-
-# ===================== BOT / ROUTER / SCHED =====================
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
-router = Router()
-scheduler = AsyncIOScheduler(timezone=TZ)
-
-PENDING: dict[int, str] = {}  # user_id -> chosen employee
-
-
-# ===================== HELPERS =====================
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-def clean_text(s: str) -> str:
-    s = (s or "").strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-def now_tz() -> datetime:
-    return datetime.now(TZ)
-
-def today_key() -> str:
-    return now_tz().strftime("%Y-%m-%d")
-
-def month_key_for(dt: datetime) -> str:
-    # New cycle starts on day 2
-    if dt.day >= 2:
-        return dt.strftime("%Y-%m")
-    prev = (dt.replace(day=1) - timedelta(days=1))
-    return prev.strftime("%Y-%m")
-
-def short(s: str, n: int = 120) -> str:
-    s = clean_text(s)
-    return s if len(s) <= n else (s[: n - 1] + "…")
-
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("nazorat-bot")
 
 # ===================== DB =====================
+
 def db_conn():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -111,522 +88,504 @@ def db_conn():
 def db_init():
     with db_conn() as con:
         con.execute("""
-            CREATE TABLE IF NOT EXISTS complaints(
+            CREATE TABLE IF NOT EXISTS complaints (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL,
-                month_key TEXT NOT NULL,
-                from_user_id INTEGER NOT NULL,
-                from_username TEXT,
-                from_fullname TEXT,
                 employee TEXT NOT NULL,
                 text TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'open',          -- open|done|rejected
-                decided_at TEXT,
-                decided_by INTEGER,
-                group_message_id INTEGER,
-                group_chat_id INTEGER
+                status TEXT NOT NULL DEFAULT 'open',      -- open | done | rejected
+                from_user_id INTEGER NOT NULL,
+                from_fullname TEXT,
+                from_username TEXT
             )
         """)
-        con.execute("CREATE INDEX IF NOT EXISTS idx_compl_month ON complaints(month_key)")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_compl_status ON complaints(status)")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_compl_user ON complaints(from_user_id)")
-
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS alerts_sent(
-                day_key TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                sent_at TEXT NOT NULL,
-                PRIMARY KEY(day_key, kind)
-            )
-        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_complaints_employee ON complaints(employee)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_complaints_status ON complaints(status)")
         con.commit()
 
-def db_wipe_all():
-    # full reset: delete all rows + reset autoincrement
-    with db_conn() as con:
-        con.execute("DELETE FROM complaints")
-        con.execute("DELETE FROM alerts_sent")
-        con.execute("DELETE FROM sqlite_sequence WHERE name IN ('complaints','alerts_sent')")
-        con.commit()
-
-def db_add_complaint(m: Message, employee: str, text: str) -> int:
-    dt = now_tz()
-    mk = month_key_for(dt)
+def db_add_complaint(employee: str, text: str, user_id: int, fullname: str, username: str | None) -> int:
     with db_conn() as con:
         cur = con.execute("""
-            INSERT INTO complaints(created_at, month_key, from_user_id, from_username, from_fullname, employee, text, status)
-            VALUES(?,?,?,?,?,?,?, 'open')
-        """, (
-            dt.isoformat(),
-            mk,
-            m.from_user.id,
-            (m.from_user.username if m.from_user else None),
-            (m.from_user.full_name if m.from_user else None),
-            employee,
-            text,
-        ))
+            INSERT INTO complaints (created_at, employee, text, status, from_user_id, from_fullname, from_username)
+            VALUES (?, ?, ?, 'open', ?, ?, ?)
+        """, (datetime.now(TZ).isoformat(timespec="seconds"), employee, text, user_id, fullname, username))
         con.commit()
         return int(cur.lastrowid)
 
-def db_attach_group_message(complaint_id: int, group_chat_id: int, group_message_id: int):
+def db_get_complaint(cid: int):
     with db_conn() as con:
-        con.execute("""
-            UPDATE complaints
-            SET group_chat_id=?, group_message_id=?
-            WHERE id=?
-        """, (group_chat_id, group_message_id, complaint_id))
+        return con.execute("SELECT * FROM complaints WHERE id=?", (cid,)).fetchone()
+
+def db_set_status(cid: int, status: str):
+    with db_conn() as con:
+        con.execute("UPDATE complaints SET status=? WHERE id=?", (status, cid))
         con.commit()
 
-def db_get(complaint_id: int):
+def db_stats():
     with db_conn() as con:
-        return con.execute("SELECT * FROM complaints WHERE id=?", (complaint_id,)).fetchone()
+        total = con.execute("SELECT COUNT(*) AS c FROM complaints").fetchone()["c"]
+        open_ = con.execute("SELECT COUNT(*) AS c FROM complaints WHERE status='open'").fetchone()["c"]
+        done = con.execute("SELECT COUNT(*) AS c FROM complaints WHERE status='done'").fetchone()["c"]
+        rej = con.execute("SELECT COUNT(*) AS c FROM complaints WHERE status='rejected'").fetchone()["c"]
+        return total, open_, done, rej
 
-def db_set_status(complaint_id: int, status: str, decided_by: int) -> bool:
-    dt = now_tz()
-    with db_conn() as con:
-        row = con.execute("SELECT status FROM complaints WHERE id=?", (complaint_id,)).fetchone()
-        if not row:
-            return False
-        if row["status"] in ("done", "rejected"):
-            return False
-        con.execute("""
-            UPDATE complaints
-            SET status=?, decided_at=?, decided_by=?
-            WHERE id=?
-        """, (status, dt.isoformat(), decided_by, complaint_id))
-        con.commit()
-        return True
-
-def db_today_total() -> int:
-    dt = now_tz()
-    start = datetime.combine(dt.date(), dtime(0, 0), tzinfo=TZ)
-    end = start + timedelta(days=1)
-    with db_conn() as con:
-        return int(con.execute("""
-            SELECT COUNT(*) AS c FROM complaints
-            WHERE created_at >= ? AND created_at < ?
-        """, (start.isoformat(), end.isoformat())).fetchone()["c"])
-
-def db_today_stats():
-    dt = now_tz()
-    start = datetime.combine(dt.date(), dtime(0, 0), tzinfo=TZ)
-    end = start + timedelta(days=1)
-    mk = month_key_for(dt)
-
-    with db_conn() as con:
-        total_today = int(con.execute("""
-            SELECT COUNT(*) AS c FROM complaints
-            WHERE created_at >= ? AND created_at < ?
-        """, (start.isoformat(), end.isoformat())).fetchone()["c"])
-
-        done_today = int(con.execute("""
-            SELECT COUNT(*) AS c FROM complaints
-            WHERE created_at >= ? AND created_at < ? AND status='done'
-        """, (start.isoformat(), end.isoformat())).fetchone()["c"])
-
-        rejected_today = int(con.execute("""
-            SELECT COUNT(*) AS c FROM complaints
-            WHERE created_at >= ? AND created_at < ? AND status='rejected'
-        """, (start.isoformat(), end.isoformat())).fetchone()["c"])
-
-        open_now = int(con.execute("""
-            SELECT COUNT(*) AS c FROM complaints WHERE status='open'
-        """).fetchone()["c"])
-
-        month_total = int(con.execute("""
-            SELECT COUNT(*) AS c FROM complaints WHERE month_key=?
-        """, (mk,)).fetchone()["c"])
-
-    return {
-        "date": dt.strftime("%Y-%m-%d"),
-        "month_key": mk,
-        "total_today": total_today,
-        "done_today": done_today,
-        "rejected_today": rejected_today,
-        "open_now": open_now,
-        "month_total": month_total,
-    }
-
-def db_month_top_employees(mk: str, limit: int = 10):
-    with db_conn() as con:
-        rows = con.execute("""
-            SELECT employee, COUNT(*) AS c
-            FROM complaints
-            WHERE month_key=?
-            GROUP BY employee
-            ORDER BY c DESC, employee ASC
-            LIMIT ?
-        """, (mk, limit)).fetchall()
-        return [(r["employee"], int(r["c"])) for r in rows]
-
-def db_list_open(limit: int = 20):
+def db_list_open(limit: int = 20, offset: int = 0):
     with db_conn() as con:
         return con.execute("""
-            SELECT id, employee, text, from_fullname, from_username, from_user_id
-            FROM complaints
+            SELECT * FROM complaints
             WHERE status='open'
             ORDER BY id DESC
-            LIMIT ?
-        """, (limit,)).fetchall()
+            LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
 
-def db_alert_already_sent(day: str, kind: str) -> bool:
+def db_list_by_employee(employee: str, limit: int = 20, offset: int = 0):
     with db_conn() as con:
-        row = con.execute("SELECT 1 FROM alerts_sent WHERE day_key=? AND kind=?", (day, kind)).fetchone()
-        return row is not None
+        return con.execute("""
+            SELECT * FROM complaints
+            WHERE employee=?
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+        """, (employee, limit, offset)).fetchall()
 
-def db_mark_alert_sent(day: str, kind: str):
+def db_reset_all():
     with db_conn() as con:
-        con.execute("""
-            INSERT OR IGNORE INTO alerts_sent(day_key, kind, sent_at)
-            VALUES(?,?,?)
-        """, (day, kind, now_tz().isoformat()))
+        con.execute("DELETE FROM complaints")
         con.commit()
+        try:
+            con.execute("VACUUM")
+            con.commit()
+        except Exception:
+            pass
 
+# ===================== HELPERS =====================
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+def short(text: str, n: int = 140) -> str:
+    text = (text or "").strip()
+    if len(text) <= n:
+        return text
+    return text[: n - 1] + "…"
+
+def fmt_dt(iso_s: str) -> str:
+    try:
+        dt = datetime.fromisoformat(iso_s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TZ)
+        return dt.astimezone(TZ).strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return iso_s[:16] if iso_s else "—"
+
+async def notify_admins(text: str):
+    for aid in ADMIN_IDS:
+        try:
+            await bot.send_message(aid, text)
+        except Exception as e:
+            log.warning("notify_admins failed for %s: %s", aid, e)
+
+async def notify_group(text: str):
+    if not GROUP_ID:
+        return
+    try:
+        await bot.send_message(GROUP_ID, text)
+    except Exception as e:
+        log.warning("notify_group failed: %s", e)
+
+async def setup_bot_commands():
+    cmds = [
+        BotCommand(command="start", description="Бошлаш"),
+        BotCommand(command="complaint", description="Шикоят ёзиш"),
+        BotCommand(command="myid", description="ID кўриш"),
+        BotCommand(command="admin", description="Админ панель (админ)"),
+        BotCommand(command="stats", description="Статистика (админ)"),
+        BotCommand(command="reset", description="Базани 0 қилиш (админ)"),
+    ]
+    await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
+
+# ===================== BOT / DISPATCHER =====================
+
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
+router = Router()
+dp = Dispatcher(storage=MemoryStorage())
+dp.include_router(router)
+
+# ===================== FSM =====================
+
+class ComplaintFlow(StatesGroup):
+    choose_employee = State()
+    enter_text = State()
 
 # ===================== KEYBOARDS =====================
-def kb_employees():
+
+def kb_start():
     b = InlineKeyboardBuilder()
-    for name in EMPLOYEES:
-        b.button(text=name, callback_data=f"emp:{name}")
+    b.button(text="📝 Янги шикоят", callback_data="c:new")
+    b.button(text="🆔 Менинг ID", callback_data="u:myid")
     b.adjust(2)
     return b.as_markup()
 
-def kb_group_actions(complaint_id: int):
+def kb_employee_pick():
     b = InlineKeyboardBuilder()
-    b.button(text="✅ Хато бартараф этилди", callback_data=f"act:done:{complaint_id}")
-    b.button(text="❌ Асосли эмас (рад)", callback_data=f"act:rejected:{complaint_id}")
-    b.adjust(1)
+    for name in EMPLOYEES:
+        b.button(text=name, callback_data=f"c:emp:{name}")
+    b.adjust(2)
     return b.as_markup()
 
 def kb_admin_panel():
     b = InlineKeyboardBuilder()
-    b.button(text="📊 Статистика (/stats)", callback_data="adm:stats")
-    b.button(text="📥 Очиқ шикоятлар", callback_data="adm:open")
-    b.button(text="🏆 Топ ходимлар (ой)", callback_data="adm:top")
+    b.button(text="📨 Очиқ шикоятлар", callback_data="adm:open:0")
+    b.button(text="👤 Ходим бўйича шикоятлар", callback_data="adm:byemp")
+    b.button(text="📊 /stats", callback_data="adm:stats")
     b.adjust(1)
     return b.as_markup()
 
+def kb_complaint_actions(cid: int):
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Ёпиш (DONE)", callback_data=f"adm:done:{cid}")
+    b.button(text="❌ Рад этиш (REJECT)", callback_data=f"adm:reject:{cid}")
+    b.adjust(2)
+    return b.as_markup()
 
-# ===================== USER NOTIFICATIONS =====================
-REJECT_TEXT = (
-    "Сизнинг шикоятингиз кўриб чиқилди ✅\n\n"
-    "Ҳозирча ушбу ҳолат тасдиқланмади.\n"
-    "Барча мурожаатлар диққат билан текширилади.\n\n"
-    "Фаоллигингиз учун раҳмат 🤝"
-)
-DONE_TEXT = (
-    "Сизнинг шикоятингиз қабул қилинди ✅\n\n"
-    "Муаммо бартараф этилди.\n"
-    "Эътиборингиз учун раҳмат 🙌"
-)
+def kb_employee_list_admin():
+    b = InlineKeyboardBuilder()
+    for name in EMPLOYEES:
+        b.button(text=name, callback_data=f"admemp:{name}:0")
+    b.adjust(2)
+    return b.as_markup()
 
+def kb_more_employee(employee: str, offset: int):
+    b = InlineKeyboardBuilder()
+    b.button(text="➡️ Яна", callback_data=f"admemp:{employee}:{offset}")
+    b.button(text="🔙 Ходим танлаш", callback_data="adm:byemp")
+    b.adjust(2)
+    return b.as_markup()
 
-# ===================== ALERT =====================
-async def maybe_send_daily_alert():
-    day = today_key()
-    kind = "threshold"
-    if db_alert_already_sent(day, kind):
-        return
-    total = db_today_total()
-    if total < ALERT_THRESHOLD:
-        return
-    db_mark_alert_sent(day, kind)
-
-    msg = (
-        f"🚨 <b>ALERT</b>\n"
-        f"Бугун шикоятлар сони <b>{total}</b> тага етди (лимит: {ALERT_THRESHOLD})."
-        + ("\n\n🧪 <b>TEST MODE</b>" if TEST_MODE else "")
-    )
-    await bot.send_message(GROUP_ID, msg)
-
+def kb_more_open(offset: int):
+    b = InlineKeyboardBuilder()
+    b.button(text="➡️ Яна", callback_data=f"adm:open:{offset}")
+    b.adjust(1)
+    return b.as_markup()
 
 # ===================== COMMANDS =====================
+
 @router.message(Command("start"))
 async def cmd_start(m: Message):
-    if m.chat.type != "private":
-        await m.answer("✅ Nazorat bot ишлаяпти.")
-        return
-    await m.answer(
-        "Салом! 👋\n\n"
-        "Бу бот орқали шикоят/камчилик ҳақида хабар беришингиз мумкин.\n\n"
-        "Шикоят ёзиш: /complaint\n"
-        "ID кўриш: /myid\n"
-        + ("\n\n🧪 TEST MODE ON" if TEST_MODE else "")
+    txt = (
+        "👋 Ассалому алейкум!\n\n"
+        "Бу <b>Ishxona Nazorat Bot</b>.\n"
+        "Шикоят ёзиш учун <b>📝 Янги шикоят</b> тугмасини босинг.\n\n"
+        "Агар сиз админ бўлсангиз: /admin"
     )
+    await m.answer(txt, reply_markup=kb_start())
+
+@router.message(Command("complaint"))
+async def cmd_complaint(m: Message, state: FSMContext):
+    await state.set_state(ComplaintFlow.choose_employee)
+    await m.answer("Ким ҳақида шикоят ёзмоқчисиз? (ходимни танланг)", reply_markup=kb_employee_pick())
 
 @router.message(Command("myid"))
 async def cmd_myid(m: Message):
     await m.answer(f"🆔 Сизнинг ID: <code>{m.from_user.id}</code>")
 
-@router.message(Command("complaint"))
-async def cmd_complaint(m: Message):
-    if m.chat.type != "private":
-        return
-    PENDING[m.from_user.id] = ""
-    await m.answer("Қайси ходим бўйича шикоят? Танланг:", reply_markup=kb_employees())
-
 @router.message(Command("admin"))
 async def cmd_admin(m: Message):
     if not is_admin(m.from_user.id):
-        await m.answer("⛔ Фақат админ.")
+        await m.answer("⛔ Бу бўлим фақат админлар учун.")
         return
-    await m.answer("🛠 Админ панель:", reply_markup=kb_admin_panel())
+    await m.answer("🛠 Админ панел:", reply_markup=kb_admin_panel())
 
 @router.message(Command("stats"))
 async def cmd_stats(m: Message):
     if not is_admin(m.from_user.id):
         await m.answer("⛔ Фақат админ.")
         return
-    st = db_today_stats()
+    total, open_, done, rej = db_stats()
     await m.answer(
-        f"📊 <b>Статистика</b>\n"
-        f"Сана: <b>{st['date']}</b>\n"
-        f"Ой цикли: <b>{st['month_key']}</b> (2-санадан)\n\n"
-        f"Бугун жами шикоят: <b>{st['total_today']}</b>\n"
-        f"✅ Бартараф: <b>{st['done_today']}</b>\n"
-        f"❌ Рад: <b>{st['rejected_today']}</b>\n"
-        f"⏳ Очиқ: <b>{st['open_now']}</b>\n"
-        f"📌 Ой бўйича жами: <b>{st['month_total']}</b>"
+        "📊 <b>Статистика</b>\n"
+        f"Жами: <b>{total}</b>\n"
+        f"Очиқ: <b>{open_}</b>\n"
+        f"Ёпилган: <b>{done}</b>\n"
+        f"Рад этилган: <b>{rej}</b>"
     )
 
 @router.message(Command("reset"))
 async def cmd_reset(m: Message):
-    # Full wipe + restart (admin only)
+    """
+    DELETE emas! Faqat admin va bron code bilan:
+    /reset BRON-RESET-2026
+    -> bazani 0 qiladi va process exit (Railway restart).
+    """
     if not is_admin(m.from_user.id):
         await m.answer("⛔ Фақат админ.")
         return
 
-    db_wipe_all()
-    await m.answer("🧹 База тозаланди. Бот қайта ишга тушяпти...")
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await m.answer("Код керак.\nМисол:\n<code>/reset BRON-RESET-2026</code>")
+        return
 
-    # give Telegram time to send the message, then exit (Railway restarts)
-    await asyncio.sleep(1.2)
+    code = parts[1].strip()
+    if code != RESET_CODE:
+        await m.answer("⛔ Нотўғри брон-код.")
+        return
+
+    db_reset_all()
+    await m.answer("✅ База 0 қилинди. Бот қайта ишга тушяпти…")
+    # Railway restart qilish uchun chiqиб кетамиз
+    await asyncio.sleep(1)
     raise SystemExit(0)
 
+# ===================== CALLBACKS: START BUTTONS =====================
 
-# ===================== CALLBACKS =====================
+@router.callback_query(F.data == "c:new")
+async def cb_new(c: CallbackQuery, state: FSMContext):
+    await state.set_state(ComplaintFlow.choose_employee)
+    await c.message.answer("Ким ҳақида шикоят? (ходимни танланг)", reply_markup=kb_employee_pick())
+    await c.answer()
+
+@router.callback_query(F.data == "u:myid")
+async def cb_myid(c: CallbackQuery):
+    await c.message.answer(f"🆔 Сизнинг ID: <code>{c.from_user.id}</code>")
+    await c.answer()
+
+# ===================== CALLBACKS: COMPLAINT FLOW =====================
+
+@router.callback_query(F.data.startswith("c:emp:"))
+async def cb_choose_employee(c: CallbackQuery, state: FSMContext):
+    employee = c.data.split("c:emp:", 1)[1].strip()
+    await state.update_data(employee=employee)
+    await state.set_state(ComplaintFlow.enter_text)
+    await c.message.answer(
+        f"✅ Танланди: <b>{employee}</b>\n\n"
+        "Энди <b>Шикоят мазмуни</b>ни ёзинг:"
+    )
+    await c.answer()
+
+@router.message(ComplaintFlow.enter_text)
+async def st_enter_text(m: Message, state: FSMContext):
+    data = await state.get_data()
+    employee = data.get("employee")
+    text = (m.text or "").strip()
+
+    if not employee:
+        await state.clear()
+        await m.answer("Хатолик: ходим танланмаган. /complaint дан қайта бошланг.")
+        return
+
+    if not text or len(text) < 3:
+        await m.answer("Шикоят мазмуни жуда қисқа. Батафсилроқ ёзинг:")
+        return
+
+    cid = db_add_complaint(
+        employee=employee,
+        text=text,
+        user_id=m.from_user.id,
+        fullname=(m.from_user.full_name or "").strip(),
+        username=m.from_user.username,
+    )
+    await state.clear()
+
+    # userga tasdiq
+    await m.answer(
+        "✅ Қабул қилинди.\n"
+        f"Шикоят ID: <code>{cid}</code>\n"
+        "Текширувдан кейин жавоб берилади."
+    )
+
+    # admin/groupga yuboramiz
+    uname = f"@{m.from_user.username}" if m.from_user.username else "—"
+    admin_text = (
+        "📩 <b>Янги шикоят</b>\n"
+        f"ID: <code>{cid}</code>\n"
+        f"Ходим: <b>{employee}</b>\n"
+        f"Кимдан: {m.from_user.full_name} ({uname}) | <code>{m.from_user.id}</code>\n"
+        f"Вақт: <b>{fmt_dt(datetime.now(TZ).isoformat(timespec='seconds'))}</b>\n\n"
+        f"<b>Шикоят мазмуни:</b>\n{text}"
+    )
+
+    await notify_admins(admin_text)
+    await notify_group(admin_text)
+
+    # test mode bo'lsa qo'shimcha ping
+    if TEST_MODE:
+        await notify_admins("🧪 TEST_MODE: шикоят юборилди ва админга етказилди.")
+
+# ===================== ADMIN: CALLBACKS =====================
+
 @router.callback_query(F.data.startswith("adm:"))
 async def cb_admin(c: CallbackQuery):
     if not is_admin(c.from_user.id):
         await c.answer("⛔ Фақат админ", show_alert=True)
         return
 
-    action = c.data.split("adm:", 1)[1]
+    parts = c.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
     if action == "stats":
-        st = db_today_stats()
+        total, open_, done, rej = db_stats()
         await c.message.answer(
-            f"📊 <b>Статистика</b>\n"
-            f"Сана: <b>{st['date']}</b>\n"
-            f"Ой цикли: <b>{st['month_key']}</b> (2-санадан)\n\n"
-            f"Бугун жами шикоят: <b>{st['total_today']}</b>\n"
-            f"✅ Бартараф: <b>{st['done_today']}</b>\n"
-            f"❌ Рад: <b>{st['rejected_today']}</b>\n"
-            f"⏳ Очиқ: <b>{st['open_now']}</b>\n"
-            f"📌 Ой бўйича жами: <b>{st['month_total']}</b>"
+            "📊 <b>Статистика</b>\n"
+            f"Жами: <b>{total}</b>\n"
+            f"Очиқ: <b>{open_}</b>\n"
+            f"Ёпилган: <b>{done}</b>\n"
+            f"Рад этилган: <b>{rej}</b>"
         )
         await c.answer()
         return
 
-    if action == "top":
-        st = db_today_stats()
-        mk = st["month_key"]
-        tops = db_month_top_employees(mk)
-        lines = [f"🏆 <b>Топ ходимлар (ой: {mk})</b>"]
-        if not tops:
-            lines.append("Ҳозирча маълумот йўқ.")
-        else:
-            for i, (name, cnt) in enumerate(tops, 1):
-                lines.append(f"{i}) {name}: <b>{cnt}</b>")
-        await c.message.answer("\n".join(lines))
+    if action == "byemp":
+        await c.message.answer("Кимнинг шикоятларини кўрамиз? Танланг:", reply_markup=kb_employee_list_admin())
         await c.answer()
         return
 
     if action == "open":
-        rows = db_list_open(limit=20)
+        offset = 0
+        if len(parts) >= 3 and parts[2].isdigit():
+            offset = int(parts[2])
+
+        rows = db_list_open(limit=10, offset=offset)
         if not rows:
-            await c.message.answer("📥 Очиқ шикоят йўқ ✅")
+            await c.message.answer("📭 Очиқ шикоят йўқ.")
             await c.answer()
             return
-        lines = ["📥 <b>Очиқ шикоятлар (охирги 20)</b>"]
+
         for r in rows:
             uname = f"@{r['from_username']}" if r["from_username"] else "—"
-            lines.append(
-                f"• <code>{r['id']}</code> | {r['employee']} | {short(r['text'], 60)}\n"
-                f"  {r['from_fullname']} ({uname}) | <code>{r['from_user_id']}</code>"
+            text = (
+                "📨 <b>Очиқ шикоят</b>\n"
+                f"ID: <code>{r['id']}</code>\n"
+                f"Ходим: <b>{r['employee']}</b>\n"
+                f"Вақт: <b>{fmt_dt(r['created_at'])}</b>\n"
+                f"Кимдан: {r['from_fullname']} ({uname}) | <code>{r['from_user_id']}</code>\n\n"
+                f"<b>Шикоят мазмуни:</b>\n{r['text']}"
             )
-        await c.message.answer("\n".join(lines))
+            await c.message.answer(text, reply_markup=kb_complaint_actions(int(r["id"])))
+
+        # pagination
+        await c.message.answer("⬇️ Кейингилар:", reply_markup=kb_more_open(offset + 10))
         await c.answer()
         return
 
-    await c.answer("Номаълум", show_alert=True)
+    if action in ("done", "reject"):
+        if len(parts) < 3 or not parts[2].isdigit():
+            await c.answer("Хато ID", show_alert=True)
+            return
+        cid = int(parts[2])
+        row = db_get_complaint(cid)
+        if not row:
+            await c.message.answer("Бу ID топилмади.")
+            await c.answer()
+            return
 
-@router.callback_query(F.data.startswith("emp:"))
-async def cb_employee(c: CallbackQuery):
-    if c.message.chat.type != "private":
-        await c.answer("Фақат личкада.", show_alert=True)
-        return
-    employee = c.data.split("emp:", 1)[1]
-    PENDING[c.from_user.id] = employee
-    await c.message.edit_text(f"✅ Танланди: <b>{employee}</b>\n\nЭнди шикоят мазмунини ёзинг (1 хабарда).")
-    await c.answer()
+        if action == "done":
+            db_set_status(cid, "done")
+            await c.message.answer(f"✅ ID <code>{cid}</code> ёпилди (DONE).")
+            # userga xabar (muloyim)
+            try:
+                await bot.send_message(
+                    int(row["from_user_id"]),
+                    "✅ Мурожаат кўриб чиқилди.\n"
+                    "Раҳмат. Тартиб-интизом ҳаммамиз учун муҳим."
+                )
+            except Exception:
+                pass
+            await c.answer()
+            return
 
-@router.message(F.text)
-async def handle_text(m: Message):
-    if m.chat.type != "private":
-        return
+        if action == "reject":
+            db_set_status(cid, "rejected")
+            await c.message.answer(f"❌ ID <code>{cid}</code> рад этилди (REJECT).")
+            # userga "psixologik ta'sirli" qisqa rad javob
+            try:
+                await bot.send_message(
+                    int(row["from_user_id"]),
+                    "❌ Мурожаат рад этилди.\n"
+                    "Сабаб: далил/аниқ маълумот етарли эмас.\n"
+                    "Агар ҳақиқатан муҳим бўлса — фактлар билан қайта ёзинг."
+                )
+            except Exception:
+                pass
+            await c.answer()
+            return
 
-    employee = PENDING.get(m.from_user.id)
-    if not employee:
-        return
+    await c.answer("Номаълум буйруқ", show_alert=True)
 
-    text = clean_text(m.text)
-    if not text:
-        await m.answer("Матн бўш бўлмасин.")
-        return
-
-    complaint_id = db_add_complaint(m, employee, text)
-    PENDING.pop(m.from_user.id, None)
-
-    uname = f"@{m.from_user.username}" if m.from_user.username else "—"
-    msg = (
-        f"🆕 <b>Янги шикоят</b>\n"
-        f"🧾 ID: <code>{complaint_id}</code>\n"
-        f"👤 Ходим: <b>{employee}</b>\n"
-        f"✍️ Кимдан: <b>{m.from_user.full_name}</b> ({uname}) | <code>{m.from_user.id}</code>\n"
-        f"⏱ Вақт: <b>{now_tz().strftime('%d.%m.%Y %H:%M')}</b>\n\n"
-        f"📝 <b>Шикоят мазмуни:</b>\n{text}"
-        + ("\n\n🧪 <b>TEST MODE</b>" if TEST_MODE else "")
-    )
-
-    await bot.send_message(GROUP_ID, msg, reply_markup=kb_group_actions(complaint_id))
-    await m.answer("✅ Қабул қилинди. Раҳмат!")
-
-    # check alert
-    try:
-        await maybe_send_daily_alert()
-    except Exception as e:
-        log.warning("alert check failed: %s", e)
-
-@router.callback_query(F.data.startswith("act:"))
-async def cb_action(c: CallbackQuery):
+@router.callback_query(F.data.startswith("admemp:"))
+async def cb_admin_employee_list(c: CallbackQuery):
     if not is_admin(c.from_user.id):
         await c.answer("⛔ Фақат админ", show_alert=True)
         return
 
+    # format: admemp:{employee}:{offset}
     try:
-        _, act, cid_s = c.data.split(":")
-        cid = int(cid_s)
+        _, employee, offset_s = c.data.split(":", 2)
+        offset = int(offset_s)
     except Exception:
         await c.answer("Хато data", show_alert=True)
         return
 
-    row = db_get(cid)
-    if not row:
-        await c.answer("Топилмади", show_alert=True)
+    rows = db_list_by_employee(employee, limit=10, offset=offset)
+    if not rows:
+        await c.message.answer(f"📭 <b>{employee}</b> бўйича шикоят йўқ.")
+        await c.answer()
         return
 
-    if act == "done":
-        ok = db_set_status(cid, "done", c.from_user.id)
-        if not ok:
-            await c.answer("Аллақачон ёпилган.", show_alert=True)
-            return
-        try:
-            await bot.send_message(int(row["from_user_id"]), DONE_TEXT)
-        except Exception:
-            pass
-        try:
-            await c.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        await c.message.reply(f"✅ Бартараф этилди | ID: <code>{cid}</code>")
-        await c.answer("OK")
-        return
-
-    if act == "rejected":
-        ok = db_set_status(cid, "rejected", c.from_user.id)
-        if not ok:
-            await c.answer("Аллақачон ёпилган.", show_alert=True)
-            return
-        try:
-            await bot.send_message(int(row["from_user_id"]), REJECT_TEXT)
-        except Exception:
-            pass
-        try:
-            await c.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        await c.message.reply(f"❌ Рад этилди | ID: <code>{cid}</code>")
-        await c.answer("OK")
-        return
-
-    await c.answer("Номаълум", show_alert=True)
-
-
-# ===================== REPORTS =====================
-def motivation_text(has_errors: bool, when_label: str) -> str:
-    if has_errors:
-        return (
-            f"⚠️ <b>{when_label}</b>\n"
-            f"Бугун шикоятлар бор. Диққатни ошириб ишлаймиз.\n"
-            f"💪 Тартиб — натижа!"
+    lines = [f"👤 <b>{employee}</b> — шикоятлар (охирги 10)"]
+    for r in rows:
+        st = r["status"]
+        st_icon = "⏳" if st == "open" else ("✅" if st == "done" else "❌")
+        uname = f"@{r['from_username']}" if r["from_username"] else "—"
+        lines.append(
+            f"\n{st_icon} <code>{r['id']}</code> | {fmt_dt(r['created_at'])}\n"
+            f"{short(r['text'], 110)}\n"
+            f"{r['from_fullname']} ({uname}) | <code>{r['from_user_id']}</code>"
         )
-    return (
-        f"✅ <b>{when_label}</b>\n"
-        f"Бугунча шикоят йўқ! 👏\n"
-        f"🚀 Эртанги кунга ҳам шу темп!"
+
+    await c.message.answer(
+        "\n".join(lines),
+        reply_markup=kb_more_employee(employee, offset + 10),
     )
+    await c.answer()
 
-async def send_report(when_label: str):
-    st = db_today_stats()
-    txt = (
-        motivation_text(st["total_today"] > 0, when_label)
-        + "\n\n"
-        f"📌 Бугунги шикоятлар: <b>{st['total_today']}</b>\n"
-        f"✅ Бартараф: <b>{st['done_today']}</b>\n"
-        f"❌ Рад: <b>{st['rejected_today']}</b>\n"
-        f"⏳ Очиқ: <b>{st['open_now']}</b>\n"
-        f"🗓 Ой цикли ({st['month_key']}): <b>{st['month_total']}</b>"
-        + ("\n\n🧪 <b>TEST MODE</b>" if TEST_MODE else "")
+# ===================== SCHEDULER: HEALTH ALERTS =====================
+
+async def scheduled_ping():
+    total, open_, done, rej = db_stats()
+    msg = (
+        "✅ <b>Bot ishlayapti</b>\n"
+        f"Вақт: <b>{datetime.now(TZ).strftime('%d.%m.%Y %H:%M')}</b>\n"
+        f"Очиқ: <b>{open_}</b> | Ёпилган: <b>{done}</b> | Рад: <b>{rej}</b> | Жами: <b>{total}</b>"
     )
-    await bot.send_message(GROUP_ID, txt)
-
-async def test_ping():
-    await bot.send_message(GROUP_ID, "🟣 TEST: bot ishlayapti (2 soatlik ping).")
-
-def setup_jobs():
-    scheduler.add_job(lambda: asyncio.create_task(send_report("08:00 назорат")), "cron", hour=8, minute=0)
-    scheduler.add_job(lambda: asyncio.create_task(send_report("21:00 назорат")), "cron", hour=21, minute=0)
-    scheduler.add_job(lambda: asyncio.create_task(maybe_send_daily_alert()), "interval", minutes=10)
-    if TEST_MODE:
-        scheduler.add_job(lambda: asyncio.create_task(test_ping()), "interval", hours=2)
-
+    await notify_admins(msg)
+    # groupga majburiy emas; xohlasang yoqamiz:
+    # await notify_group(msg)
 
 # ===================== MAIN =====================
+
 async def main():
     db_init()
-    await bot.delete_webhook(drop_pending_updates=True)
+    await setup_bot_commands()
 
-    dp.include_router(router)
-    setup_jobs()
+    scheduler = AsyncIOScheduler(timezone=TZ)
+    # 07:30 ва 19:30 — сен айтган 2 та вақт
+    scheduler.add_job(scheduled_ping, "cron", hour=7, minute=30)
+    scheduler.add_job(scheduled_ping, "cron", hour=19, minute=30)
+
+    if TEST_MODE:
+        # test rejimda har 30 daqiqada ping (xohlasang o'zgartirasan)
+        scheduler.add_job(lambda: asyncio.create_task(notify_admins("🧪 TEST_MODE: бот тирик.")), "cron", minute="*/30")
+
     scheduler.start()
 
-    try:
-        await bot.send_message(
-            GROUP_ID,
-            "✅ <b>Nazorat bot ишга тушди</b>"
-            + ("\n🧪 TEST MODE ON" if TEST_MODE else "")
-            + f"\n🚨 Alert threshold: {ALERT_THRESHOLD}"
-        )
-    except Exception as e:
-        log.warning("Startup message failed: %s", e)
-
+    log.info("Bot started. TZ=%s DB=%s GROUP_ID=%s ADMINS=%s", TZ_NAME, DB_PATH, GROUP_ID, list(ADMIN_IDS))
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except SystemExit:
-        raise
-    except Exception as e:
-        log.error("FATAL: %s", e)
-        sys.exit(1)
+    except (KeyboardInterrupt, SystemExit):
+        pass
