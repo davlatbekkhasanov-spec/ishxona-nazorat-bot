@@ -17,11 +17,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 
 # ------------------ CONFIG (env) ------------------
-BOT_TOKEN = os.getenv("8381505129:AAG0X7jwRHUScfwFrsxi5C5QTwGuwfn3RIE", "").strip()
-GROUP_ID_RAW = os.getenv("-1001877019294", "").strip()
-TEST_MODE = os.getenv("0", "0").strip() == "1"
-ADMIN_IDS_RAW = os.getenv("1432810519", "").strip()
-DB_PATH = os.getenv("complaints.sqlite3", "complaints.sqlite3").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8381505129:AAG0X7jwRHUScfwFrsxi5C5QTwGuwfn3RIE").strip()
+GROUP_ID_RAW = os.getenv("GROUP_ID", "-1001877019294").strip()
+TEST_MODE = os.getenv("TEST_MODE", "0").strip() == "1"
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "1432810519").strip()
+DB_PATH = os.getenv("DB_PATH", "complaints.sqlite3").strip()
 TZ_NAME = os.getenv("TZ", "Asia/Tashkent").strip()
 
 EMPLOYEES = [
