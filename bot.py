@@ -1,5 +1,4 @@
 import os
-import re
 import asyncio
 import logging
 import sqlite3
@@ -19,11 +18,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # ===================== CONFIG =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8381505129:AAG0X7jwRHUScfwFrsxi5C5QTwGuwfn3RIE").strip()
 GROUP_ID_RAW = os.getenv("GROUP_ID", "-1001877019294").strip()
-ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "1432810519").strip()  # "143,144" etc
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "1432810519").strip()
 TEST_MODE = os.getenv("TEST_MODE", "0").strip() == "1"
 DB_PATH = os.getenv("DB_PATH", "complaints.sqlite3").strip()
 TZ_NAME = os.getenv("TZ", "Asia/Tashkent").strip()
-RESET_CODE = os.getenv("RESET_CODE", "BRON-2026-RESET").strip()  # ўзинг алмаштир
+RESET_CODE = os.getenv("RESET_CODE", "BRON-2026-RESET").strip()
 
 TZ = ZoneInfo(TZ_NAME)
 
@@ -43,23 +42,25 @@ for x in ADMIN_IDS_RAW.split(","):
     if x.isdigit():
         ADMIN_IDS.add(int(x))
 
-if not ADMIN_IDS:
-    # Агар ADMIN_IDS қўйилмаган бўлса ҳам бот ишлайди, лекин панел/статистика ишламайди.
-    # Яхшиси ADMIN_IDS қўй.
-    pass
-
-# Ходимлар рўйхати (сен хоҳласанг кейин кенгайтирамиз)
+# ✅ Ходимлар 5 тага қисқарди
 EMPLOYEES = [
     "Сагдуллаев Юнус",
     "Самадов Тулкин",
     "Тохиров Муслимбек",
     "Мустафоев Абдулло",
     "Ражаббоев Пулат",
+    "Рузибоев Сардор",
+    "Собиров Самандар",
+    "Равшанов Зиёдулло",
+    "Шерназаров Толиб",
+    "Равшанов Охунжон",
 ]
+
 
 # ===================== LOGGING =====================
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("nazorat-bot")
+
 
 # ===================== BOT / DP =====================
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -88,8 +89,7 @@ def init_db():
             status TEXT NOT NULL DEFAULT 'new',   -- new/done/rejected
             created_at TEXT NOT NULL,
             closed_at TEXT,
-            admin_action_by INTEGER,
-            admin_action_note TEXT
+            admin_action_by INTEGER
         );
         """)
         con.execute("CREATE INDEX IF NOT EXISTS idx_emp ON complaints(employee);")
@@ -118,78 +118,56 @@ def employee_kb(prefix: str):
     return kb.as_markup()
 
 def complaint_actions_kb(cid: int):
+    # ✅ Бир хил кнопкалар: админда ҳам, гуруҳда ҳам чиқади
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Ёпилди (DONE)", callback_data=f"act:done:{cid}")
-    kb.button(text="❌ Рад этилди (REJECT)", callback_data=f"act:rej:{cid}")
+    kb.button(text="✅ DONE", callback_data=f"act:done:{cid}")
+    kb.button(text="❌ REJECT", callback_data=f"act:rej:{cid}")
     kb.adjust(2)
-    return kb.as_markup()
-
-def nav_kb(employee: str, pos: int, total: int, cid: int):
-    kb = InlineKeyboardBuilder()
-    # Навигация
-    if pos > 1:
-        kb.button(text="⬅️ Олдинги", callback_data=f"nav:prev:{employee}:{pos}")
-    if pos < total:
-        kb.button(text="➡️ Кейинги", callback_data=f"nav:next:{employee}:{pos}")
-    kb.adjust(2)
-
-    # Амаллар
-    kb.row(
-        InlineKeyboardBuilder().button(text="✅ DONE", callback_data=f"act:done:{cid}").as_markup().inline_keyboard[0][0],
-        InlineKeyboardBuilder().button(text="❌ REJECT", callback_data=f"act:rej:{cid}").as_markup().inline_keyboard[0][0],
-    )
-
-    kb.row(
-        InlineKeyboardBuilder().button(text="🔙 Панел", callback_data="panel:open").as_markup().inline_keyboard[0][0]
-    )
     return kb.as_markup()
 
 def panel_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="👥 Ходим танлаш", callback_data="panel:employees")
     kb.button(text="📊 Статистика", callback_data="panel:stats")
-    kb.button(text="🧹 База тозалаш + рестарт (BRON)", callback_data="panel:reset_info")
+    kb.button(text="🧹 BRON reset info", callback_data="panel:reset_info")
     kb.adjust(1)
     return kb.as_markup()
 
-async def notify_group(text: str):
-    try:
-        await bot.send_message(GROUP_ID, text)
-    except Exception as e:
-        log.warning("notify_group error: %s", e)
-
-async def notify_admins(text: str, reply_markup=None):
-    for aid in ADMIN_IDS:
-        try:
-            await bot.send_message(aid, text, reply_markup=reply_markup)
-        except Exception as e:
-            log.warning("notify_admins error to %s: %s", aid, e)
-
 def format_admin_card(row: sqlite3.Row) -> str:
-    # Талаб: "янги мурожат эмас - Янги шикоят", "тавсиф эмас - Шикоят мазмуни"
-    created = row["created_at"]
     return (
         f"<b>Янги шикоят</b>\n"
         f"ID: <code>{row['id']}</code>\n"
         f"Ходим: <b>{row['employee']}</b>\n"
         f"Кимдан: <b>{row['from_user']}</b> | <code>{row['from_user_id']}</code>\n"
-        f"Вақт: <b>{created}</b>\n\n"
+        f"Вақт: <b>{row['created_at']}</b>\n\n"
         f"<b>Шикоят мазмуни:</b>\n{row['text']}"
     )
 
 def psych_reject_text() -> str:
-    # “қисқа ва чиройли, психологик таъсир”
-    # (ҳақоратсиз, лекин қатъий)
     return (
         "Шикоятингиз қабул қилинмади.\n"
         "Илтимос, фактлар ва аниқ далиллар билан қайта юборинг. "
         "Нотўғри маълумот юбориш назоратда қайд этилади."
     )
 
+async def safe_send(chat_id: int, text: str, reply_markup=None):
+    try:
+        return await bot.send_message(chat_id, text, reply_markup=reply_markup)
+    except Exception as e:
+        log.warning("send_message error chat=%s: %s", chat_id, e)
+        return None
 
-# ===================== COMMANDS =====================
+async def notify_admins(text: str, reply_markup=None):
+    for aid in ADMIN_IDS:
+        await safe_send(aid, text, reply_markup=reply_markup)
+
+async def notify_group(text: str, reply_markup=None):
+    # ✅ гуруҳнинг ўзида ҳам кнопка бўлади
+    await safe_send(GROUP_ID, text, reply_markup=reply_markup)
+
+
+# ===================== COMMANDS MENU =====================
 async def set_commands():
-    # /start босганда командалар чиқиши учун
     try:
         await bot.set_my_commands([
             ("start", "Ботни ишга тушириш"),
@@ -198,17 +176,13 @@ async def set_commands():
             ("stats", "Статистика (фақат админ)"),
             ("ping", "Бот тирикми текшириш"),
             ("bron", "BRON reset info (фақат админ)"),
+            ("reset", "BRON reset (фақат админ)"),
         ])
     except Exception as e:
         log.warning("set_my_commands failed: %s", e)
 
 
-# ===================== USER FLOW (NO FSM, SIMPLE) =====================
-# Юзта FSM қилмай, “professional” ва барқарор вариант:
-# 1) user: "📝 Янги шикоят" -> ходим танлайди
-# 2) user: шикоят матнини ёзади
-# 3) db save -> админ/группага юборилади
-
+# ===================== USER FLOW =====================
 USER_STATE = {}  # user_id -> {"step": "...", "employee": "..."}
 
 @rt.message(Command("start"))
@@ -262,9 +236,7 @@ async def user_pick_employee(c: CallbackQuery):
 async def user_text_router(m: Message):
     uid = m.from_user.id
     st = USER_STATE.get(uid)
-    if not st:
-        return  # бошқа хабарларга жавоб бермаймиз (сен айтганингдек “ўзгаришлар қилма”)
-    if st.get("step") != "enter_text":
+    if not st or st.get("step") != "enter_text":
         return
 
     text = (m.text or "").strip()
@@ -283,12 +255,11 @@ async def user_text_router(m: Message):
         cid = con.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
         row = con.execute("SELECT * FROM complaints WHERE id=?", (cid,)).fetchone()
 
-    admin_text = format_admin_card(row)
+    card = format_admin_card(row)
 
-    # Админга тугмалар билан
-    await notify_admins(admin_text, reply_markup=complaint_actions_kb(cid))
-    # Гуруҳга оддий (тугмасиз)
-    await notify_group(admin_text)
+    # ✅ Админга ҳам, гуруҳга ҳам тугмалар билан
+    await notify_admins(card, reply_markup=complaint_actions_kb(cid))
+    await notify_group(card, reply_markup=complaint_actions_kb(cid))
 
     USER_STATE.pop(uid, None)
     await m.answer("✅ Шикоят қабул қилинди. Раҳмат.", reply_markup=user_keyboard())
@@ -301,13 +272,26 @@ async def cmd_panel(m: Message):
         return
     await m.answer("Админ панел:", reply_markup=panel_kb())
 
-@rt.callback_query(F.data == "panel:open")
-async def panel_open(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        await c.answer("No access", show_alert=True)
+@rt.message(Command("stats"))
+async def cmd_stats(m: Message):
+    if not is_admin(m.from_user.id):
         return
-    await c.message.edit_text("Админ панел:", reply_markup=panel_kb())
-    await c.answer()
+    await m.answer(await build_stats_text())
+
+async def build_stats_text() -> str:
+    with db() as con:
+        total = con.execute("SELECT COUNT(*) AS n FROM complaints").fetchone()["n"]
+        new = con.execute("SELECT COUNT(*) AS n FROM complaints WHERE status='new'").fetchone()["n"]
+        done = con.execute("SELECT COUNT(*) AS n FROM complaints WHERE status='done'").fetchone()["n"]
+        rej = con.execute("SELECT COUNT(*) AS n FROM complaints WHERE status='rejected'").fetchone()["n"]
+
+    return (
+        "<b>📊 Статистика</b>\n"
+        f"Жами: <b>{total}</b>\n"
+        f"Янги: <b>{new}</b>\n"
+        f"Ёпилган: <b>{done}</b>\n"
+        f"Рад этилган: <b>{rej}</b>\n"
+    )
 
 @rt.callback_query(F.data == "panel:employees")
 async def panel_employees(c: CallbackQuery):
@@ -329,7 +313,6 @@ async def admin_pick_employee(c: CallbackQuery):
         return
 
     employee = EMPLOYEES[idx]
-
     with db() as con:
         rows = con.execute(
             "SELECT * FROM complaints WHERE employee=? ORDER BY id DESC",
@@ -341,13 +324,19 @@ async def admin_pick_employee(c: CallbackQuery):
         await c.answer()
         return
 
-    # 1-чи (энг охиргиси)
     pos = 1
     total = len(rows)
     row = rows[pos - 1]
+
+    kb = InlineKeyboardBuilder()
+    if total > 1:
+        kb.button(text="➡️ Кейинги", callback_data=f"nav:next:{employee}:{pos}")
+    kb.button(text="🔙 Панел", callback_data="panel:back")
+    kb.adjust(2)
+
     await c.message.edit_text(
         format_admin_card(row) + f"\n\n({pos}/{total})",
-        reply_markup=nav_kb(employee, pos, total, row["id"])
+        reply_markup=kb.as_markup()
     )
     await c.answer()
 
@@ -378,17 +367,20 @@ async def admin_nav(c: CallbackQuery):
         pos = min(total, pos + 1)
 
     row = rows[pos - 1]
+
+    kb = InlineKeyboardBuilder()
+    if pos > 1:
+        kb.button(text="⬅️ Олдинги", callback_data=f"nav:prev:{employee}:{pos}")
+    if pos < total:
+        kb.button(text="➡️ Кейинги", callback_data=f"nav:next:{employee}:{pos}")
+    kb.button(text="🔙 Панел", callback_data="panel:back")
+    kb.adjust(2)
+
     await c.message.edit_text(
         format_admin_card(row) + f"\n\n({pos}/{total})",
-        reply_markup=nav_kb(employee, pos, total, row["id"])
+        reply_markup=kb.as_markup()
     )
     await c.answer()
-
-@rt.message(Command("stats"))
-async def cmd_stats(m: Message):
-    if not is_admin(m.from_user.id):
-        return
-    await m.answer(await build_stats_text())
 
 @rt.callback_query(F.data == "panel:stats")
 async def panel_stats(c: CallbackQuery):
@@ -398,25 +390,35 @@ async def panel_stats(c: CallbackQuery):
     await c.message.edit_text(await build_stats_text(), reply_markup=panel_kb())
     await c.answer()
 
-async def build_stats_text() -> str:
-    with db() as con:
-        total = con.execute("SELECT COUNT(*) AS n FROM complaints").fetchone()["n"]
-        new = con.execute("SELECT COUNT(*) AS n FROM complaints WHERE status='new'").fetchone()["n"]
-        done = con.execute("SELECT COUNT(*) AS n FROM complaints WHERE status='done'").fetchone()["n"]
-        rej = con.execute("SELECT COUNT(*) AS n FROM complaints WHERE status='rejected'").fetchone()["n"]
-
-    return (
-        "<b>📊 Статистика</b>\n"
-        f"Жами: <b>{total}</b>\n"
-        f"Янги: <b>{new}</b>\n"
-        f"Ёпилган: <b>{done}</b>\n"
-        f"Рад этилган: <b>{rej}</b>\n"
-    )
-
-@rt.callback_query(F.data.startswith("act:"))
-async def admin_action(c: CallbackQuery):
+@rt.callback_query(F.data == "panel:reset_info")
+async def panel_reset_info(c: CallbackQuery):
     if not is_admin(c.from_user.id):
         await c.answer("No access", show_alert=True)
+        return
+    await c.message.edit_text(
+        "🧹 <b>База тозалаш + рестарт</b>\n\n"
+        "Ишлатиш:\n"
+        f"<code>/reset {RESET_CODE}</code>\n\n"
+        "⚠️ Барча маълумот ўчади ва Railway ботни қайта ишга туширади.",
+        reply_markup=panel_kb()
+    )
+    await c.answer()
+
+@rt.callback_query(F.data == "panel:back")
+async def panel_back(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        await c.answer("No access", show_alert=True)
+        return
+    await c.message.edit_text("Админ панел:", reply_markup=panel_kb())
+    await c.answer()
+
+
+# ===================== ACTIONS (DONE / REJECT) =====================
+@rt.callback_query(F.data.startswith("act:"))
+async def admin_action(c: CallbackQuery):
+    # ✅ ким босса ҳам фақат админ ишлайди (гуруҳда ҳам)
+    if not is_admin(c.from_user.id):
+        await c.answer("❌ Бу тугмалар фақат админ учун.", show_alert=True)
         return
 
     _, action, cid_s = c.data.split(":")
@@ -433,8 +435,9 @@ async def admin_action(c: CallbackQuery):
                 "UPDATE complaints SET status='done', closed_at=?, admin_action_by=? WHERE id=?",
                 (now_str(), c.from_user.id, cid)
             )
-            await c.answer("✅ Ёпилди", show_alert=True)
+            # постни белгилаб қўямиз
             await c.message.edit_text(format_admin_card(row) + "\n\n✅ <b>Ёпилди (DONE)</b>")
+            await c.answer("✅ DONE", show_alert=True)
             return
 
         if action == "rej":
@@ -442,17 +445,18 @@ async def admin_action(c: CallbackQuery):
                 "UPDATE complaints SET status='rejected', closed_at=?, admin_action_by=? WHERE id=?",
                 (now_str(), c.from_user.id, cid)
             )
-            # шикоят ёзган одамга психологик хабар
+            # шикоятчига психологик рад
             try:
                 await bot.send_message(row["from_user_id"], psych_reject_text())
             except Exception as e:
                 log.warning("reject notify user failed: %s", e)
 
-            await c.answer("❌ Рад этилди", show_alert=True)
             await c.message.edit_text(format_admin_card(row) + "\n\n❌ <b>Рад этилди (REJECT)</b>")
+            await c.answer("❌ REJECT", show_alert=True)
             return
 
     await c.answer("OK")
+
 
 # ===================== BRON RESET =====================
 @rt.message(Command("bron"))
@@ -460,25 +464,11 @@ async def cmd_bron(m: Message):
     if not is_admin(m.from_user.id):
         return
     await m.answer(
-        "🧹 <b>BRON тозалаш</b>\n\n"
+        "🧹 <b>BRON reset</b>\n\n"
         "Барча шикоятларни 0 дан бошлаш ва ботни қайта ишга тушириш учун:\n"
         f"<code>/reset {RESET_CODE}</code>\n\n"
-        "⚠️ Бу фақат админда ишлайди."
+        "⚠️ Фақат админда ишлайди."
     )
-
-@rt.callback_query(F.data == "panel:reset_info")
-async def panel_reset_info(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        await c.answer("No access", show_alert=True)
-        return
-    await c.message.edit_text(
-        "🧹 <b>База тозалаш + рестарт</b>\n\n"
-        "Ишлатиш:\n"
-        f"<code>/reset {RESET_CODE}</code>\n\n"
-        "⚠️ Барча маълумот ўчади ва Railway ботни қайта ишга туширади.",
-        reply_markup=panel_kb()
-    )
-    await c.answer()
 
 @rt.message(Command("reset"))
 async def cmd_reset(m: Message):
@@ -489,7 +479,6 @@ async def cmd_reset(m: Message):
         await m.answer("❌ BRON код нотўғри.")
         return
 
-    # DB delete
     try:
         if os.path.exists(DB_PATH):
             os.remove(DB_PATH)
@@ -499,22 +488,18 @@ async def cmd_reset(m: Message):
         return
 
     await m.answer("✅ База тозаланди. Бот ҳозир қайта ишга тушади.")
-    # Railway рестарт қилиши учун процессни чиқарамиз
     await asyncio.sleep(0.8)
     raise SystemExit("BRON reset triggered")
 
 
 # ===================== SCHEDULED ALERTS =====================
 async def alert_0730():
-    # 07:30 текширув (сен айтган “бот 100% текшириб туриш”)
-    msg = "✅ Bot online (07:30 текширув)"
-    await notify_admins(msg)
+    await notify_admins("✅ Bot online (07:30 текширув)")
     if TEST_MODE:
         await notify_admins("🧪 TEST_MODE=1: 07:30 тест сигнали")
 
 async def alert_1930():
-    msg = "✅ Bot online (19:30 текширув)"
-    await notify_admins(msg)
+    await notify_admins("✅ Bot online (19:30 текширув)")
     if TEST_MODE:
         await notify_admins("🧪 TEST_MODE=1: 19:30 тест сигнали")
 
