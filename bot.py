@@ -24,13 +24,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 
 # ===================== CONFIG =====================
-BOT_TOKEN = (os.getenv("8381505129:AAG0X7jwRHUScfwFrsxi5C5QTwGuwfn3RIE") or "").strip()
-GROUP_ID = int((os.getenv("-1001877019294") or "0").strip() or "0")
+BOT_TOKEN = (os.getenv("8381505129:AAG0X7jwRHUScfwFrsxi5C5QTwGuwfn3RIE")
+GROUP_ID = int((os.getenv("-1001877019294"))
 
-TEST_MODE = (os.getenv("1") or "0").strip() == "1"
+TEST_MODE = (os.getenv("1")
 
 ADMIN_IDS = set()
-_raw_admins = (os.getenv("1432810519") or "").strip()
+_raw_admins = (os.getenv("1432810519")
 if _raw_admins:
     for x in _raw_admins.split(","):
         x = x.strip()
