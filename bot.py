@@ -39,11 +39,16 @@ TZ = ZoneInfo(TZ_NAME)
 
 # !!! EMPLOYEES ni o'zingniki bilan qoldir / to'ldir
 EMPLOYEES = [
-    "Сагдуллаев Юнус",
+     "Сагдуллаев Юнус",
     "Самадов Тулкин",
     "Тохиров Муслимбек",
     "Мустафоев Абдулло",
-    "Рахабоев Пулат",
+    "Ражаббоев Пулат",
+    "Рузибоев Сардор",
+    "Собиров Самандар",
+    "Равшанов Зиёдулло",
+    "Шерназаров Толиб",
+    "Равшанов Охунжон",
 ]
 
 def parse_admin_ids(raw: str) -> set[int]:
@@ -571,7 +576,7 @@ async def main():
     await setup_bot_commands()
 
     scheduler = AsyncIOScheduler(timezone=TZ)
-    # 07:30 ва 19:30 — сен айтган 2 та вақт
+    # 08:00 ва 20:00 — сен айтган 2 та вақт
     scheduler.add_job(scheduled_ping, "cron", hour=7, minute=30)
     scheduler.add_job(scheduled_ping, "cron", hour=19, minute=30)
 
