@@ -3,6 +3,7 @@ import re
 import asyncio
 import logging
 import sqlite3
+import sys
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
@@ -25,7 +26,7 @@ TEST_MODE = os.getenv("TEST_MODE", "0").strip() == "1"
 DB_PATH = os.getenv("DB_PATH", "complaints.sqlite3").strip()
 TZ_NAME = os.getenv("TZ", "Asia/Tashkent").strip()
 
-ALERT_THRESHOLD = int(os.getenv("ALERT_THRESHOLD", "3").strip() or "3")  # default 3
+ALERT_THRESHOLD = int((os.getenv("ALERT_THRESHOLD", "3").strip() or "3"))
 
 EMPLOYEES = [
     "Сагдуллаев Юнус",
@@ -71,8 +72,7 @@ dp = Dispatcher()
 router = Router()
 scheduler = AsyncIOScheduler(timezone=TZ)
 
-# user_id -> chosen employee
-PENDING: dict[int, str] = {}
+PENDING: dict[int, str] = {}  # user_id -> chosen employee
 
 
 # ===================== HELPERS =====================
@@ -120,7 +120,7 @@ def db_init():
                 from_fullname TEXT,
                 employee TEXT NOT NULL,
                 text TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'open',          -- open|done|rejected|deleted
+                status TEXT NOT NULL DEFAULT 'open',          -- open|done|rejected
                 decided_at TEXT,
                 decided_by INTEGER,
                 group_message_id INTEGER,
@@ -131,7 +131,6 @@ def db_init():
         con.execute("CREATE INDEX IF NOT EXISTS idx_compl_status ON complaints(status)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_compl_user ON complaints(from_user_id)")
 
-        # Alert history (so we don't spam)
         con.execute("""
             CREATE TABLE IF NOT EXISTS alerts_sent(
                 day_key TEXT NOT NULL,
@@ -140,6 +139,14 @@ def db_init():
                 PRIMARY KEY(day_key, kind)
             )
         """)
+        con.commit()
+
+def db_wipe_all():
+    # full reset: delete all rows + reset autoincrement
+    with db_conn() as con:
+        con.execute("DELETE FROM complaints")
+        con.execute("DELETE FROM alerts_sent")
+        con.execute("DELETE FROM sqlite_sequence WHERE name IN ('complaints','alerts_sent')")
         con.commit()
 
 def db_add_complaint(m: Message, employee: str, text: str) -> int:
@@ -180,7 +187,7 @@ def db_set_status(complaint_id: int, status: str, decided_by: int) -> bool:
         row = con.execute("SELECT status FROM complaints WHERE id=?", (complaint_id,)).fetchone()
         if not row:
             return False
-        if row["status"] in ("done", "rejected", "deleted"):
+        if row["status"] in ("done", "rejected"):
             return False
         con.execute("""
             UPDATE complaints
@@ -190,30 +197,14 @@ def db_set_status(complaint_id: int, status: str, decided_by: int) -> bool:
         con.commit()
         return True
 
-def db_delete_mark(complaint_id: int, decided_by: int) -> bool:
-    dt = now_tz()
-    with db_conn() as con:
-        row = con.execute("SELECT status FROM complaints WHERE id=?", (complaint_id,)).fetchone()
-        if not row:
-            return False
-        if row["status"] == "deleted":
-            return False
-        con.execute("""
-            UPDATE complaints
-            SET status='deleted', decided_at=?, decided_by=?
-            WHERE id=?
-        """, (dt.isoformat(), decided_by, complaint_id))
-        con.commit()
-        return True
-
-def db_today_total_non_deleted() -> int:
+def db_today_total() -> int:
     dt = now_tz()
     start = datetime.combine(dt.date(), dtime(0, 0), tzinfo=TZ)
     end = start + timedelta(days=1)
     with db_conn() as con:
         return int(con.execute("""
             SELECT COUNT(*) AS c FROM complaints
-            WHERE created_at >= ? AND created_at < ? AND status!='deleted'
+            WHERE created_at >= ? AND created_at < ?
         """, (start.isoformat(), end.isoformat())).fetchone()["c"])
 
 def db_today_stats():
@@ -225,7 +216,7 @@ def db_today_stats():
     with db_conn() as con:
         total_today = int(con.execute("""
             SELECT COUNT(*) AS c FROM complaints
-            WHERE created_at >= ? AND created_at < ? AND status!='deleted'
+            WHERE created_at >= ? AND created_at < ?
         """, (start.isoformat(), end.isoformat())).fetchone()["c"])
 
         done_today = int(con.execute("""
@@ -243,7 +234,7 @@ def db_today_stats():
         """).fetchone()["c"])
 
         month_total = int(con.execute("""
-            SELECT COUNT(*) AS c FROM complaints WHERE month_key=? AND status!='deleted'
+            SELECT COUNT(*) AS c FROM complaints WHERE month_key=?
         """, (mk,)).fetchone()["c"])
 
     return {
@@ -261,7 +252,7 @@ def db_month_top_employees(mk: str, limit: int = 10):
         rows = con.execute("""
             SELECT employee, COUNT(*) AS c
             FROM complaints
-            WHERE month_key=? AND status!='deleted'
+            WHERE month_key=?
             GROUP BY employee
             ORDER BY c DESC, employee ASC
             LIMIT ?
@@ -271,7 +262,7 @@ def db_month_top_employees(mk: str, limit: int = 10):
 def db_list_open(limit: int = 20):
     with db_conn() as con:
         return con.execute("""
-            SELECT id, created_at, employee, text, from_fullname, from_username, from_user_id
+            SELECT id, employee, text, from_fullname, from_username, from_user_id
             FROM complaints
             WHERE status='open'
             ORDER BY id DESC
@@ -304,63 +295,52 @@ def kb_group_actions(complaint_id: int):
     b = InlineKeyboardBuilder()
     b.button(text="✅ Хато бартараф этилди", callback_data=f"act:done:{complaint_id}")
     b.button(text="❌ Асосли эмас (рад)", callback_data=f"act:rejected:{complaint_id}")
-    b.button(text="🗑 Ўчириш", callback_data=f"act:delete:{complaint_id}")
     b.adjust(1)
     return b.as_markup()
 
 def kb_admin_panel():
     b = InlineKeyboardBuilder()
-    b.button(text="📊 Статистика", callback_data="adm:stats")
-    b.button(text="📥 Очиқ жалобалар", callback_data="adm:open")
+    b.button(text="📊 Статистика (/stats)", callback_data="adm:stats")
+    b.button(text="📥 Очиқ шикоятлар", callback_data="adm:open")
     b.button(text="🏆 Топ ходимлар (ой)", callback_data="adm:top")
     b.adjust(1)
     return b.as_markup()
 
 
-# ===================== SOFT USER NOTIFICATIONS =====================
+# ===================== USER NOTIFICATIONS =====================
 REJECT_TEXT = (
-    "Сизнинг мурожаатингиз кўриб чиқилди ✅\n\n"
+    "Сизнинг шикоятингиз кўриб чиқилди ✅\n\n"
     "Ҳозирча ушбу ҳолат тасдиқланмади.\n"
     "Барча мурожаатлар диққат билан текширилади.\n\n"
     "Фаоллигингиз учун раҳмат 🤝"
 )
 DONE_TEXT = (
-    "Сизнинг мурожаатингиз қабул қилинди ✅\n\n"
+    "Сизнинг шикоятингиз қабул қилинди ✅\n\n"
     "Муаммо бартараф этилди.\n"
     "Эътиборингиз учун раҳмат 🙌"
 )
 
 
-# ===================== ALERT (3 complaints/day) =====================
+# ===================== ALERT =====================
 async def maybe_send_daily_alert():
     day = today_key()
-    kind = "threshold3"
+    kind = "threshold"
     if db_alert_already_sent(day, kind):
         return
-
-    total = db_today_total_non_deleted()
+    total = db_today_total()
     if total < ALERT_THRESHOLD:
         return
-
     db_mark_alert_sent(day, kind)
 
     msg = (
         f"🚨 <b>ALERT</b>\n"
-        f"Бугун мурожаатлар сони <b>{total}</b> тага етди.\n"
-        f"Чора кўриш керак: сабабларни тез текшириб чиқамиз."
+        f"Бугун шикоятлар сони <b>{total}</b> тага етди (лимит: {ALERT_THRESHOLD})."
         + ("\n\n🧪 <b>TEST MODE</b>" if TEST_MODE else "")
     )
     await bot.send_message(GROUP_ID, msg)
 
-    # optional: DM admin too (first admin)
-    try:
-        admin_id = next(iter(ADMIN_IDS))
-        await bot.send_message(admin_id, f"🚨 ALERT: bugun {total} ta murojaat (threshold {ALERT_THRESHOLD}).")
-    except Exception:
-        pass
 
-
-# ===================== HANDLERS =====================
+# ===================== COMMANDS =====================
 @router.message(Command("start"))
 async def cmd_start(m: Message):
     if m.chat.type != "private":
@@ -368,8 +348,8 @@ async def cmd_start(m: Message):
         return
     await m.answer(
         "Салом! 👋\n\n"
-        "Бу бот орқали хатолик/камчилик ҳақида мурожаат қолдиришингиз мумкин.\n\n"
-        "Мурожаат ёзиш: /complaint\n"
+        "Бу бот орқали шикоят/камчилик ҳақида хабар беришингиз мумкин.\n\n"
+        "Шикоят ёзиш: /complaint\n"
         "ID кўриш: /myid\n"
         + ("\n\n🧪 TEST MODE ON" if TEST_MODE else "")
     )
@@ -383,48 +363,48 @@ async def cmd_complaint(m: Message):
     if m.chat.type != "private":
         return
     PENDING[m.from_user.id] = ""
-    await m.answer("Ким ҳақида мурожаат? Танланг:", reply_markup=kb_employees())
+    await m.answer("Қайси ходим бўйича шикоят? Танланг:", reply_markup=kb_employees())
 
 @router.message(Command("admin"))
 async def cmd_admin(m: Message):
     if not is_admin(m.from_user.id):
-        await m.answer("⛔ Бу бўлим фақат админ учун.")
+        await m.answer("⛔ Фақат админ.")
         return
     await m.answer("🛠 Админ панель:", reply_markup=kb_admin_panel())
 
-@router.message(Command("del"))
-async def cmd_del(m: Message):
-    # /del 123  -> delete complaint by id (admin only)
+@router.message(Command("stats"))
+async def cmd_stats(m: Message):
     if not is_admin(m.from_user.id):
         await m.answer("⛔ Фақат админ.")
         return
-    parts = (m.text or "").split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        await m.answer("Формат: /del 123")
+    st = db_today_stats()
+    await m.answer(
+        f"📊 <b>Статистика</b>\n"
+        f"Сана: <b>{st['date']}</b>\n"
+        f"Ой цикли: <b>{st['month_key']}</b> (2-санадан)\n\n"
+        f"Бугун жами шикоят: <b>{st['total_today']}</b>\n"
+        f"✅ Бартараф: <b>{st['done_today']}</b>\n"
+        f"❌ Рад: <b>{st['rejected_today']}</b>\n"
+        f"⏳ Очиқ: <b>{st['open_now']}</b>\n"
+        f"📌 Ой бўйича жами: <b>{st['month_total']}</b>"
+    )
+
+@router.message(Command("reset"))
+async def cmd_reset(m: Message):
+    # Full wipe + restart (admin only)
+    if not is_admin(m.from_user.id):
+        await m.answer("⛔ Фақат админ.")
         return
 
-    cid = int(parts[1])
-    row = db_get(cid)
-    if not row:
-        await m.answer("Топилмади.")
-        return
+    db_wipe_all()
+    await m.answer("🧹 База тозаланди. Бот қайта ишга тушяпти...")
 
-    ok = db_delete_mark(cid, m.from_user.id)
-    if not ok:
-        await m.answer("Аллақачон ўчирилган.")
-        return
+    # give Telegram time to send the message, then exit (Railway restarts)
+    await asyncio.sleep(1.2)
+    raise SystemExit(0)
 
-    # try to delete group message
-    deleted_msg = False
-    try:
-        if row["group_chat_id"] and row["group_message_id"]:
-            await bot.delete_message(int(row["group_chat_id"]), int(row["group_message_id"]))
-            deleted_msg = True
-    except Exception:
-        deleted_msg = False
 
-    await m.answer("🗑 Ўчирилди." + (" (Гуруҳдан ҳам ўчди ✅)" if deleted_msg else " (Гуруҳда ўчмаслиги мумкин — ботга delete permission керак)"))
-
+# ===================== CALLBACKS =====================
 @router.callback_query(F.data.startswith("adm:"))
 async def cb_admin(c: CallbackQuery):
     if not is_admin(c.from_user.id):
@@ -434,18 +414,16 @@ async def cb_admin(c: CallbackQuery):
     action = c.data.split("adm:", 1)[1]
     if action == "stats":
         st = db_today_stats()
-        mk = st["month_key"]
-        msg = (
+        await c.message.answer(
             f"📊 <b>Статистика</b>\n"
             f"Сана: <b>{st['date']}</b>\n"
-            f"Ой цикли: <b>{mk}</b> (2-санадан)\n\n"
-            f"Бугун жами: <b>{st['total_today']}</b>\n"
+            f"Ой цикли: <b>{st['month_key']}</b> (2-санадан)\n\n"
+            f"Бугун жами шикоят: <b>{st['total_today']}</b>\n"
             f"✅ Бартараф: <b>{st['done_today']}</b>\n"
             f"❌ Рад: <b>{st['rejected_today']}</b>\n"
             f"⏳ Очиқ: <b>{st['open_now']}</b>\n"
             f"📌 Ой бўйича жами: <b>{st['month_total']}</b>"
         )
-        await c.message.answer(msg)
         await c.answer()
         return
 
@@ -466,17 +444,16 @@ async def cb_admin(c: CallbackQuery):
     if action == "open":
         rows = db_list_open(limit=20)
         if not rows:
-            await c.message.answer("📥 Очиқ мурожаат йўқ ✅")
+            await c.message.answer("📥 Очиқ шикоят йўқ ✅")
             await c.answer()
             return
-        lines = ["📥 <b>Очиқ мурожаатлар (охирги 20)</b>"]
+        lines = ["📥 <b>Очиқ шикоятлар (охирги 20)</b>"]
         for r in rows:
             uname = f"@{r['from_username']}" if r["from_username"] else "—"
             lines.append(
                 f"• <code>{r['id']}</code> | {r['employee']} | {short(r['text'], 60)}\n"
                 f"  {r['from_fullname']} ({uname}) | <code>{r['from_user_id']}</code>"
             )
-        lines.append("\n🗑 Ўчириш: /del ID ёки гуруҳдаги “Ўчириш” тугмаси.")
         await c.message.answer("\n".join(lines))
         await c.answer()
         return
@@ -490,9 +467,7 @@ async def cb_employee(c: CallbackQuery):
         return
     employee = c.data.split("emp:", 1)[1]
     PENDING[c.from_user.id] = employee
-    await c.message.edit_text(
-        f"✅ Танланди: <b>{employee}</b>\n\nЭнди мурожаат матнини ёзинг (1 хабарда)."
-    )
+    await c.message.edit_text(f"✅ Танланди: <b>{employee}</b>\n\nЭнди шикоят мазмунини ёзинг (1 хабарда).")
     await c.answer()
 
 @router.message(F.text)
@@ -514,21 +489,19 @@ async def handle_text(m: Message):
 
     uname = f"@{m.from_user.username}" if m.from_user.username else "—"
     msg = (
-        f"🆕 <b>Янги мурожаат</b>\n"
+        f"🆕 <b>Янги шикоят</b>\n"
         f"🧾 ID: <code>{complaint_id}</code>\n"
         f"👤 Ходим: <b>{employee}</b>\n"
         f"✍️ Кимдан: <b>{m.from_user.full_name}</b> ({uname}) | <code>{m.from_user.id}</code>\n"
         f"⏱ Вақт: <b>{now_tz().strftime('%d.%m.%Y %H:%M')}</b>\n\n"
-        f"📝 <b>Тавсиф:</b>\n{text}"
+        f"📝 <b>Шикоят мазмуни:</b>\n{text}"
         + ("\n\n🧪 <b>TEST MODE</b>" if TEST_MODE else "")
     )
 
-    sent = await bot.send_message(GROUP_ID, msg, reply_markup=kb_group_actions(complaint_id))
-    db_attach_group_message(complaint_id, GROUP_ID, sent.message_id)
-
+    await bot.send_message(GROUP_ID, msg, reply_markup=kb_group_actions(complaint_id))
     await m.answer("✅ Қабул қилинди. Раҳмат!")
 
-    # check alert immediately after new complaint
+    # check alert
     try:
         await maybe_send_daily_alert()
     except Exception as e:
@@ -555,14 +528,12 @@ async def cb_action(c: CallbackQuery):
     if act == "done":
         ok = db_set_status(cid, "done", c.from_user.id)
         if not ok:
-            await c.answer("Аллақачон ёпилган/ўчирилган.", show_alert=True)
+            await c.answer("Аллақачон ёпилган.", show_alert=True)
             return
-
         try:
             await bot.send_message(int(row["from_user_id"]), DONE_TEXT)
         except Exception:
             pass
-
         try:
             await c.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -574,14 +545,12 @@ async def cb_action(c: CallbackQuery):
     if act == "rejected":
         ok = db_set_status(cid, "rejected", c.from_user.id)
         if not ok:
-            await c.answer("Аллақачон ёпилган/ўчирилган.", show_alert=True)
+            await c.answer("Аллақачон ёпилган.", show_alert=True)
             return
-
         try:
             await bot.send_message(int(row["from_user_id"]), REJECT_TEXT)
         except Exception:
             pass
-
         try:
             await c.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -590,42 +559,20 @@ async def cb_action(c: CallbackQuery):
         await c.answer("OK")
         return
 
-    if act == "delete":
-        ok = db_delete_mark(cid, c.from_user.id)
-        if not ok:
-            await c.answer("Аллақачон ўчирилган.", show_alert=True)
-            return
-
-        # try delete group message
-        try:
-            if row["group_chat_id"] and row["group_message_id"]:
-                await bot.delete_message(int(row["group_chat_id"]), int(row["group_message_id"]))
-                await c.answer("Ўчирилди")
-                return
-        except Exception:
-            # cannot delete in group -> at least remove buttons and mark
-            try:
-                await c.message.edit_reply_markup(reply_markup=None)
-            except Exception:
-                pass
-            await c.message.reply(f"🗑 Админ томонидан ўчирилди (гуруҳдан ўчириш учун ботга delete permission керак) | ID: <code>{cid}</code>")
-            await c.answer("Ўчирилди")
-            return
-
-    await c.answer("Номаълум амал", show_alert=True)
+    await c.answer("Номаълум", show_alert=True)
 
 
-# ===================== SCHEDULED REPORTS =====================
+# ===================== REPORTS =====================
 def motivation_text(has_errors: bool, when_label: str) -> str:
     if has_errors:
         return (
             f"⚠️ <b>{when_label}</b>\n"
-            f"Бугун мурожаатлар бор. Диққатни ошириб ишлаймиз.\n"
+            f"Бугун шикоятлар бор. Диққатни ошириб ишлаймиз.\n"
             f"💪 Тартиб — натижа!"
         )
     return (
         f"✅ <b>{when_label}</b>\n"
-        f"Бугунча мурожаат йўқ! 👏\n"
+        f"Бугунча шикоят йўқ! 👏\n"
         f"🚀 Эртанги кунга ҳам шу темп!"
     )
 
@@ -634,7 +581,7 @@ async def send_report(when_label: str):
     txt = (
         motivation_text(st["total_today"] > 0, when_label)
         + "\n\n"
-        f"📌 Бугунги мурожаатлар: <b>{st['total_today']}</b>\n"
+        f"📌 Бугунги шикоятлар: <b>{st['total_today']}</b>\n"
         f"✅ Бартараф: <b>{st['done_today']}</b>\n"
         f"❌ Рад: <b>{st['rejected_today']}</b>\n"
         f"⏳ Очиқ: <b>{st['open_now']}</b>\n"
@@ -649,10 +596,7 @@ async def test_ping():
 def setup_jobs():
     scheduler.add_job(lambda: asyncio.create_task(send_report("08:00 назорат")), "cron", hour=8, minute=0)
     scheduler.add_job(lambda: asyncio.create_task(send_report("21:00 назорат")), "cron", hour=21, minute=0)
-
-    # periodic alert check (backup)
     scheduler.add_job(lambda: asyncio.create_task(maybe_send_daily_alert()), "interval", minutes=10)
-
     if TEST_MODE:
         scheduler.add_job(lambda: asyncio.create_task(test_ping()), "interval", hours=2)
 
@@ -679,4 +623,10 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except SystemExit:
+        raise
+    except Exception as e:
+        log.error("FATAL: %s", e)
+        sys.exit(1)
