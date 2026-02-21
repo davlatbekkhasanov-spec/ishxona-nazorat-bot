@@ -7,35 +7,37 @@ from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
-from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton,
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
-from aiogram.client.default import DefaultBotProperties
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 
 # ===================== CONFIG =====================
-BOT_TOKEN = os.getenv("8381505129:AAG0X7jwRHUScfwFrsxi5C5QTwGuwfn3RIE").strip()
-GROUP_ID = int(os.getenv("-1001877019294").strip() or 
+BOT_TOKEN = (os.getenv("8381505129:AAG0X7jwRHUScfwFrsxi5C5QTwGuwfn3RIE") or "").strip()
+GROUP_ID = int((os.getenv("-1001877019294") or "0").strip() or "0")
 
-TEST_MODE = os.getenv("TEST_MODE", "0").strip() == "1"
+TEST_MODE = (os.getenv("1") or "0").strip() == "1"
 
 ADMIN_IDS = set()
-_raw_admins = os.getenv("ADMIN_IDS", "").strip()
+_raw_admins = (os.getenv("1432810519") or "").strip()
 if _raw_admins:
     for x in _raw_admins.split(","):
         x = x.strip()
         if x.isdigit():
             ADMIN_IDS.add(int(x))
 
-DB_PATH = os.getenv("DB_PATH", "complaints.sqlite3")
+DB_PATH = (os.getenv("DB_PATH") or "complaints.sqlite3").strip()
 TZ = ZoneInfo("Asia/Tashkent")
 
 EMPLOYEES = [
@@ -54,6 +56,18 @@ EMPLOYEES = [
 START_TS = time.time()
 
 
+# ===================== SAFETY CHECKS =====================
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN topilmadi. Railway -> Variables ga BOT_TOKEN qo'ying.")
+# aiogram token format: digits:letters
+if ":" not in BOT_TOKEN or len(BOT_TOKEN.split(":", 1)[0]) < 5:
+    raise RuntimeError("BOT_TOKEN formati noto'g'ri ko'rinadi. Railway -> Variables ni tekshiring.")
+
+
+# ===================== LOGGING =====================
+logging.basicConfig(level=logging.INFO)
+
+
 # ===================== DB =====================
 def db():
     return sqlite3.connect(DB_PATH)
@@ -69,7 +83,7 @@ def init_db():
         employee TEXT NOT NULL,
         description TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        status TEXT NOT NULL,
+        status TEXT NOT NULL,              -- open/resolved/rejected
         closed_at TEXT,
         closed_by_id INTEGER,
         closed_by_username TEXT,
@@ -79,17 +93,17 @@ def init_db():
     con.commit()
     con.close()
 
-def insert_complaint(user_id, username, employee, desc, created_at):
+def insert_complaint(user_id, username, employee, desc, created_at_iso):
     con = db()
     cur = con.cursor()
     cur.execute("""
         INSERT INTO complaints (tg_user_id, tg_username, employee, description, created_at, status)
         VALUES (?, ?, ?, ?, ?, 'open')
-    """, (user_id, username, employee, desc, created_at))
+    """, (user_id, username, employee, desc, created_at_iso))
     con.commit()
-    row_id = cur.lastrowid
+    cid = cur.lastrowid
     con.close()
-    return row_id
+    return cid
 
 def set_group_message_id(complaint_id, msg_id):
     con = db()
@@ -98,14 +112,14 @@ def set_group_message_id(complaint_id, msg_id):
     con.commit()
     con.close()
 
-def close_complaint(complaint_id, status, closed_by_id, closed_by_username, closed_at):
+def close_complaint(complaint_id, status, closed_by_id, closed_by_username, closed_at_iso):
     con = db()
     cur = con.cursor()
     cur.execute("""
         UPDATE complaints
         SET status=?, closed_at=?, closed_by_id=?, closed_by_username=?
         WHERE id=? AND status='open'
-    """, (status, closed_at, closed_by_id, closed_by_username, complaint_id))
+    """, (status, closed_at_iso, closed_by_id, closed_by_username, complaint_id))
     con.commit()
     changed = cur.rowcount
     con.close()
@@ -118,10 +132,10 @@ def get_day_stats(day: date):
     cur = con.cursor()
     cur.execute("""
         SELECT
-          SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) as open_cnt,
-          SUM(CASE WHEN status='resolved' THEN 1 ELSE 0 END) as resolved_cnt,
-          SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) as rejected_cnt,
-          COUNT(*) as total_cnt
+            SUM(CASE WHEN status='open' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN status='resolved' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END),
+            COUNT(*)
         FROM complaints
         WHERE created_at BETWEEN ? AND ?
     """, (start, end))
@@ -135,12 +149,12 @@ def get_day_stats(day: date):
     }
 
 def period_start_for(dt: datetime) -> datetime:
-    # Hisob oyimiz 2-sanadan boshlanadi
+    # Hisob "oyi" har oy 2-sanadan boshlanadi
     if dt.day >= 2:
         return datetime(dt.year, dt.month, 2, 0, 0, 0, tzinfo=TZ)
-    first_of_month = datetime(dt.year, dt.month, 1, 0, 0, 0, tzinfo=TZ)
-    prev_month_last = first_of_month - timedelta(days=1)
-    return datetime(prev_month_last.year, prev_month_last.month, 2, 0, 0, 0, tzinfo=TZ)
+    first = datetime(dt.year, dt.month, 1, 0, 0, 0, tzinfo=TZ)
+    prev_last = first - timedelta(days=1)
+    return datetime(prev_last.year, prev_last.month, 2, 0, 0, 0, tzinfo=TZ)
 
 def get_period_stats(now: datetime):
     start_dt = period_start_for(now)
@@ -148,10 +162,10 @@ def get_period_stats(now: datetime):
     cur = con.cursor()
     cur.execute("""
         SELECT
-          SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) as open_cnt,
-          SUM(CASE WHEN status='resolved' THEN 1 ELSE 0 END) as resolved_cnt,
-          SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) as rejected_cnt,
-          COUNT(*) as total_cnt
+            SUM(CASE WHEN status='open' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN status='resolved' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END),
+            COUNT(*)
         FROM complaints
         WHERE created_at >= ?
     """, (start_dt.isoformat(),))
@@ -166,7 +180,18 @@ def get_period_stats(now: datetime):
     }
 
 
-# ===================== UI =====================
+# ===================== HELPERS =====================
+def is_admin(uid: int) -> bool:
+    # ADMIN_IDS bo'sh bo'lsa ham admin deb qabul qilamiz (qulaylik uchun)
+    return (not ADMIN_IDS) or (uid in ADMIN_IDS)
+
+def uptime_str() -> str:
+    sec = int(time.time() - START_TS)
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
 def employees_kb():
     rows = []
     row = []
@@ -191,37 +216,25 @@ class ComplaintFlow(StatesGroup):
     enter_description = State()
 
 
-# ===================== BOT =====================
-logging.basicConfig(level=logging.INFO)
-
+# ===================== BOT / DISPATCHER =====================
 bot = Bot(
     token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 dp = Dispatcher(storage=MemoryStorage())
 
 
-def is_admin(uid: int) -> bool:
-    return (not ADMIN_IDS) or (uid in ADMIN_IDS)
-
-
-def uptime_str() -> str:
-    sec = int(time.time() - START_TS)
-    h = sec // 3600
-    m = (sec % 3600) // 60
-    s = sec % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
+# ===================== COMMANDS =====================
 @dp.message(CommandStart())
-async def start(m: Message):
+async def start(m: Message, state: FSMContext):
+    await state.clear()
     if m.chat.type != "private":
         await m.answer("✅ Nazorat bot ishlayapti.\nGuruh ID uchun: /chatid")
         return
 
     await m.answer(
-        "Салом! 👋\n"
-        "Жалоба/хатони қайси ходимга тегишли эканини танланг:",
+        "Салом! 👋\n\n"
+        "Жалоба қайси ходимга тегишли — танланг:",
         reply_markup=employees_kb()
     )
 
@@ -239,7 +252,8 @@ async def status_cmd(m: Message):
         f"✅ Bot LIVE\n"
         f"⏱ Uptime: <b>{uptime_str()}</b>\n"
         f"🧪 TEST_MODE: <b>{'ON' if TEST_MODE else 'OFF'}</b>\n"
-        f"👥 GROUP_ID: <code>{GROUP_ID}</code>"
+        f"👥 GROUP_ID: <code>{GROUP_ID}</code>\n"
+        f"👮 ADMIN_IDS: <code>{','.join(map(str, sorted(ADMIN_IDS))) if ADMIN_IDS else 'ANY'}</code>"
     )
     await m.answer(txt)
 
@@ -254,8 +268,7 @@ async def test_complaint(m: Message):
     if not is_admin(m.from_user.id):
         return await m.answer("❌ Siz admin emassiz.")
     if GROUP_ID == 0:
-        return await m.answer("❌ GROUP_ID o‘rnatilmagan.")
-
+        return await m.answer("❌ GROUP_ID o‘rnatilmagan. Guruhda /chatid qilib oling.")
     now = datetime.now(TZ)
     employee = EMPLOYEES[0]
     desc = f"TEST жалоба ✅ | uptime={uptime_str()} | {now.strftime('%d.%m.%Y %H:%M:%S')}"
@@ -263,8 +276,9 @@ async def test_complaint(m: Message):
     cid = insert_complaint(m.from_user.id, username, employee, desc, now.isoformat())
 
     who = f"@{username}" if username else f"ID:{m.from_user.id}"
+    prefix = "🧪 <b>TEST</b>\n" if TEST_MODE else ""
     text = (
-        f"🧪 <b>TEST: Янги хатолик</b>\n\n"
+        f"{prefix}🚨 <b>Янги хатолик аниқланди</b>\n\n"
         f"👤 <b>Ким ёзди:</b> {who}\n"
         f"🧑‍💼 <b>Ходим:</b> {employee}\n"
         f"📝 <b>Тавсиф:</b>\n{desc}\n\n"
@@ -276,6 +290,7 @@ async def test_complaint(m: Message):
     await m.answer("✅ TEST жалоба гуруҳга чиқди.")
 
 
+# ===================== FLOW: PRIVATE -> GROUP =====================
 @dp.callback_query(F.data.startswith("emp:"))
 async def choose_employee(cb: CallbackQuery, state: FSMContext):
     if cb.message.chat.type != "private":
@@ -285,26 +300,34 @@ async def choose_employee(cb: CallbackQuery, state: FSMContext):
     employee = cb.data.split(":", 1)[1]
     await state.update_data(employee=employee)
     await state.set_state(ComplaintFlow.enter_description)
+
     await cb.message.edit_text(
         f"✅ Танланди: <b>{employee}</b>\n\n"
-        f"Энди хатолик тавсифини ёзинг (қанча аниқ бўлса, шунча яхши)."
+        f"Энди хатолик тавсифини ёзинг."
     )
     await cb.answer()
 
-
 @dp.message(ComplaintFlow.enter_description)
 async def receive_description(m: Message, state: FSMContext):
+    if m.chat.type != "private":
+        return
+
     if GROUP_ID == 0:
-        await m.answer("❌ Ҳозирча GROUP_ID қўйилмаган. Гуруҳда /chatid қилиб, Railway’да GROUP_ID ни қўйинг.")
+        await m.answer(
+            "❌ GROUP_ID қўйилмаган.\n"
+            "Гуруҳда /chatid қилиб олинг ва Railway Variables'да GROUP_ID ни қўйинг."
+        )
         await state.clear()
         return
 
     data = await state.get_data()
-    employee = data["employee"]
+    employee = data.get("employee")
     desc = (m.text or "").strip()
+    if not employee:
+        await state.clear()
+        return await m.answer("❌ Ходим танланмади. /start дан бошланг.")
     if not desc:
-        await m.answer("Тавсиф бўш бўлмасин. Қайта ёзинг.")
-        return
+        return await m.answer("Тавсиф бўш бўлмасин. Қайта ёзинг.")
 
     now = datetime.now(TZ)
     username = m.from_user.username or ""
@@ -330,35 +353,49 @@ async def receive_description(m: Message, state: FSMContext):
     await state.clear()
 
 
+# ===================== GROUP BUTTONS =====================
 @dp.callback_query(F.data.startswith("close:"))
 async def close_in_group(cb: CallbackQuery):
+    # tugmalar faqat asosiy guruhda ishlasin
     if GROUP_ID != 0 and cb.message.chat.id != GROUP_ID:
         await cb.answer("Бу тугма фақат асосий гуруҳда ишлайди.", show_alert=True)
         return
 
-    _, cid, status = cb.data.split(":")
-    cid = int(cid)
+    try:
+        _, cid_s, status = cb.data.split(":")
+        cid = int(cid_s)
+    except Exception:
+        return await cb.answer("Нотўғри callback.", show_alert=True)
 
     if status not in ("resolved", "rejected"):
-        await cb.answer("Нотўғри статус.", show_alert=True)
-        return
+        return await cb.answer("Нотўғри статус.", show_alert=True)
 
     now = datetime.now(TZ)
     closer_username = cb.from_user.username or ""
     ok = close_complaint(cid, status, cb.from_user.id, closer_username, now.isoformat())
     if not ok:
-        await cb.answer("Бу хатолик аллақачон ёпилган.", show_alert=True)
-        return
+        return await cb.answer("Бу хатолик аллақачон ёпилган.", show_alert=True)
 
     status_text = "✅ Бартараф этилди" if status == "resolved" else "❌ Асосли эмас (рад)"
     closer_tag = f"@{closer_username}" if closer_username else f"ID:{cb.from_user.id}"
 
-    new_text = cb.message.html_text.replace(
-        "📌 <b>Статус:</b> ⏳ Кутилмоқда",
-        f"📌 <b>Статус:</b> {status_text}\n"
-        f"🔒 <b>Ёпди:</b> {closer_tag}\n"
-        f"🕒 <b>Ёпилган вақт:</b> {now.strftime('%d.%m.%Y %H:%M')}"
-    )
+    # Eski matnda "Кутилмоқда" qatori bo'lmasa ham, oxiriga status qo'shamiz
+    old = cb.message.html_text or ""
+    if "📌 <b>Статус:</b>" in old:
+        new_text = old.replace(
+            "📌 <b>Статус:</b> ⏳ Кутилмоқда",
+            f"📌 <b>Статус:</b> {status_text}\n"
+            f"🔒 <b>Ёпди:</b> {closer_tag}\n"
+            f"🕒 <b>Ёпилган вақт:</b> {now.strftime('%d.%m.%Y %H:%M')}"
+        )
+    else:
+        new_text = (
+            old
+            + "\n\n"
+            + f"📌 <b>Статус:</b> {status_text}\n"
+              f"🔒 <b>Ёпди:</b> {closer_tag}\n"
+              f"🕒 <b>Ёпилган вақт:</b> {now.strftime('%d.%m.%Y %H:%M')}"
+        )
 
     await cb.message.edit_text(new_text, reply_markup=None)
     await cb.answer("Ёпилди ✅")
@@ -374,14 +411,14 @@ async def send_motivation_report(time_label: str):
     day_stats = get_day_stats(today)
     period_stats = get_period_stats(now)
 
-    test_prefix = "🧪 <b>TEST MODE</b>\n" if TEST_MODE else ""
+    test_prefix = "🧪 <b>TEST</b>\n" if TEST_MODE else ""
     up = uptime_str()
 
     if day_stats["total"] == 0:
         text = (
             f"{test_prefix}🌟 <b>{time_label} — Бугунча ҳолат</b>\n\n"
             f"Хатолик йўқ ✅\n"
-            f"Шунақа давом этамиз! Эртага яна ҳам тоза ишлаймиз 💪\n\n"
+            f"Шунақа давом этамиз! 💪\n\n"
             f"⏱ Uptime: <b>{up}</b>"
         )
     else:
@@ -391,7 +428,7 @@ async def send_motivation_report(time_label: str):
             f"Очиқ: <b>{day_stats['open']}</b>\n"
             f"Бартараф: <b>{day_stats['resolved']}</b>\n"
             f"Рад: <b>{day_stats['rejected']}</b>\n\n"
-            f"⚡ Мотивация: хатоликни эртагага қолдирмай, шу заҳоти ёпамиз!\n\n"
+            f"⚡ Мотивация: хатоликни кечиктирмаймиз — шу заҳоти ёпамиз!\n\n"
             f"⏱ Uptime: <b>{up}</b>"
         )
 
@@ -411,43 +448,46 @@ async def new_period_announcement():
         return
     now = datetime.now(TZ)
     start = period_start_for(now)
-    test_prefix = "🧪 <b>TEST MODE</b>\n" if TEST_MODE else ""
+    test_prefix = "🧪 <b>TEST</b>\n" if TEST_MODE else ""
     await bot.send_message(
         GROUP_ID,
         f"{test_prefix}🆕 <b>Янги ҳисоб ойи бошланди!</b>\n"
         f"📅 Бошланиш: <b>{start.strftime('%d.%m.%Y')}</b>\n\n"
-        f"Ишни янги ойда тоза бошлаймиз 💪"
+        f"Янги ой — янги натижа! 💪"
     )
 
 def setup_scheduler():
     sch = AsyncIOScheduler(timezone=TZ)
-    sch.add_job(send_motivation_report, "cron", hour=8, minute=0, args=["08:00"])
-    sch.add_job(send_motivation_report, "cron", hour=21, minute=0, args=["21:00"])
-    sch.add_job(new_period_announcement, "cron", day=2, hour=0, minute=5)
+
+    # APScheduler coroutine'ni ba'zan oddiy func bilan chaqirish xavfsizroq:
+    sch.add_job(lambda: asyncio.create_task(send_motivation_report("08:00")), "cron", hour=8, minute=0)
+    sch.add_job(lambda: asyncio.create_task(send_motivation_report("21:00")), "cron", hour=21, minute=0)
+    sch.add_job(lambda: asyncio.create_task(new_period_announcement()), "cron", day=2, hour=0, minute=5)
+
     sch.start()
     return sch
 
 
 # ===================== MAIN =====================
 async def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is empty. Set it in Railway Variables.")
-
     init_db()
     setup_scheduler()
 
-    # Startup heartbeat (admin + group)
+    # Startup ping
     try:
-        start_msg = f"✅ Nazorat bot start/restart\n⏱ Uptime: <b>{uptime_str()}</b>\n🧪 TEST_MODE: <b>{'ON' if TEST_MODE else 'OFF'}</b>"
-        # Adminlarga
+        start_msg = (
+            f"✅ Nazorat bot start/restart\n"
+            f"🧪 TEST_MODE: <b>{'ON' if TEST_MODE else 'OFF'}</b>\n"
+            f"⏱ Uptime: <b>{uptime_str()}</b>"
+        )
+        if GROUP_ID != 0:
+            await bot.send_message(GROUP_ID, start_msg)
+        # Adminlarga ham (bo'lsa)
         for aid in ADMIN_IDS:
             try:
                 await bot.send_message(aid, start_msg)
             except:
                 pass
-        # Guruhga (GROUP_ID bo'lsa)
-        if GROUP_ID != 0:
-            await bot.send_message(GROUP_ID, start_msg)
     except:
         pass
 
