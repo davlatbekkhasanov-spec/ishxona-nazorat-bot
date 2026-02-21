@@ -22,8 +22,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 
 # ===================== CONFIG =====================
-BOT_TOKEN = os.getenv("8381505129:AAG0X7jwRHUScfwFrsxi5C5QTwGuwfn3RIE", "").strip()
-GROUP_ID = int(os.getenv("-1001877019294", "0").strip() or "0")
+BOT_TOKEN = os.getenv("8381505129:AAG0X7jwRHUScfwFrsxi5C5QTwGuwfn3RIE").strip()
+GROUP_ID = int(os.getenv("-1001877019294").strip() or 
 
 TEST_MODE = os.getenv("TEST_MODE", "0").strip() == "1"
 
