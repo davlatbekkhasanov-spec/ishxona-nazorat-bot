@@ -540,5 +540,25 @@ async def main():
     log.info("Bot started.")
     await dp.start_polling(bot)
 
+@rt.message(Command("whoami"))
+async def cmd_whoami(m: Message):
+    if not m.from_user:
+        return
+    await m.answer(
+        "🪪 <b>Sizning ma'lumotlaringiz</b>\n"
+        f"ID: <code>{m.from_user.id}</code>\n"
+        f"Ism: <b>{escape_html(m.from_user.full_name or 'Unknown')}</b>\n"
+        f"Admin: <b>{'YES' if is_admin(m.from_user.id) else 'NO'}</b>"
+    )
+
+
+# ===================== Main =====================
+async def main():
+    init_db()
+    setup_scheduler()
+    await set_commands()
+    log.info("Bot started.")
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
     asyncio.run(main())
