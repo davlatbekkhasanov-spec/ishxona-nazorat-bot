@@ -354,16 +354,12 @@ async def cb_emp(c: CallbackQuery):
     await c.answer()
 
 # ===================== Receive complaint text =====================
-@rt.message(F.text)
+@rt.message(F.text & ~F.text.startswith("/"))
 async def any_text(m: Message):
-    # Команда эмас бўлса ва draft бор бўлса — шикоят деб қабул қиламиз
     if not m.from_user:
         return
-    if (m.text or "").startswith("/"):
-        return  # командаларни алоҳида handler ушлайди
     d = DRAFTS.get(m.from_user.id)
     if not d:
-        # user ўзи билмай ёзиб юборса — қайта йўналтирамиз
         return await m.answer("Ходимни танланг 👇", reply_markup=kb_employee_select())
 
     text = (m.text or "").strip()
@@ -373,7 +369,6 @@ async def any_text(m: Message):
     from_name = fmt_user_name(m)
     cid = add_complaint(d.employee, m.from_user.id, from_name, text)
 
-    # groupga yuboramiz
     row = get_complaint(cid)
     msg = await bot.send_message(
         chat_id=GROUP_ID,
@@ -382,11 +377,8 @@ async def any_text(m: Message):
     )
     set_group_message(cid, GROUP_ID, msg.message_id)
 
-    # userga tasdiq
     await m.answer("✅ Қабул қилинди. Раҳбарият кўриб чиқади.")
-    # draft tugadi
     DRAFTS.pop(m.from_user.id, None)
-
 
 # ===================== Admin actions: DONE / REJECT =====================
 async def notify_user_reject(user_id: int):
