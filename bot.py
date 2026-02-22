@@ -354,7 +354,7 @@ async def cb_emp(c: CallbackQuery):
     await c.answer()
 
 # ===================== Receive complaint text =====================
-@rt.message(F.text & ~F.text.startswith("/"))
+@rt.message(F.text, F.chat.type == "private")
 async def any_text(m: Message):
     if not m.from_user:
         return
