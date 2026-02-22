@@ -518,28 +518,24 @@ def setup_scheduler():
     sch.start()
 
 
-# ===================== Main =====================
+# ===================== Commands menu =====================
 async def set_commands():
-    # /startда командалар чиқиши учун Telegram менюга қўямиз
     from aiogram.types import BotCommand
     cmds = [
         BotCommand(command="start", description="Ботни ишга тушириш / ходим танлаш"),
         BotCommand(command="panel", description="Админ панель (ходимлар бўйича)"),
         BotCommand(command="stats", description="Статистика"),
         BotCommand(command="reset", description="Тозалаш (фақат админ)"),
+        BotCommand(command="whoami", description="ID ва admin текшириш"),
+        BotCommand(command="factory_reset", description="Тўлиқ reset + restart (фақат админ)"),
     ]
     try:
         await bot.set_my_commands(cmds)
     except Exception as e:
         log.warning("set_my_commands failed: %r", e)
 
-async def main():
-    init_db()
-    setup_scheduler()
-    await set_commands()
-    log.info("Bot started.")
-    await dp.start_polling(bot)
 
+# ===================== /whoami =====================
 @rt.message(Command("whoami"))
 async def cmd_whoami(m: Message):
     if not m.from_user:
@@ -548,8 +544,56 @@ async def cmd_whoami(m: Message):
         "🪪 <b>Sizning ma'lumotlaringiz</b>\n"
         f"ID: <code>{m.from_user.id}</code>\n"
         f"Ism: <b>{escape_html(m.from_user.full_name or 'Unknown')}</b>\n"
-        f"Admin: <b>{'YES' if is_admin(m.from_user.id) else 'NO'}</b>"
+        f"Admin: <b>{'YES' if is_admin(m.from_user.id) else 'NO'}</b>\n"
+        f"ADMIN_IDS: <code>{', '.join(str(x) for x in sorted(ADMIN_IDS))}</code>"
     )
+
+
+# ===================== Factory reset helpers =====================
+FACTORY_RESET_CODE = os.getenv("FACTORY_RESET_CODE", "").strip()
+
+def _safe_remove_db_files(db_path: str) -> int:
+    removed = 0
+    if not db_path:
+        return 0
+    for p in (db_path, db_path + "-wal", db_path + "-shm"):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+                removed += 1
+        except Exception as e:
+            log.warning("DB file remove failed for %s: %s", p, e)
+    return removed
+
+
+# ===================== /factory_reset =====================
+@rt.message(Command("factory_reset"))
+async def cmd_factory_reset(m: Message):
+    if not m.from_user or not is_admin(m.from_user.id):
+        return
+
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return await m.answer("Формат: <code>/factory_reset FACTORY_RESET_CODE</code>")
+
+    code = parts[1].strip()
+
+    if not FACTORY_RESET_CODE:
+        return await m.answer("❗ Railway Variables'да <b>FACTORY_RESET_CODE</b> қўйилмаган.")
+
+    if code != FACTORY_RESET_CODE:
+        return await m.answer("❌ Код нотўғри.")
+
+    removed = _safe_remove_db_files(DB_PATH)
+
+    await m.answer(
+        "✅ <b>Factory Reset</b> бажарилди.\n"
+        f"🗑 Ўчирилди: <b>{removed}</b> та DB файл.\n"
+        "♻️ Бот қайта ишга тушяпти..."
+    )
+
+    await asyncio.sleep(0.6)
+    raise SystemExit("FACTORY_RESET triggered")
 
 
 # ===================== Main =====================
