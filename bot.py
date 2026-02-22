@@ -1,50 +1,41 @@
 import os
+import re
 import asyncio
 import logging
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, Router, F
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
-from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 
-# ===================== CONFIG =====================
+# ===================== CONFIG (Railway env) =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8381505129:AAG0X7jwRHUScfwFrsxi5C5QTwGuwfn3RIE").strip()
 GROUP_ID_RAW = os.getenv("GROUP_ID", "-1001877019294").strip()
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "1432810519").strip()
 TEST_MODE = os.getenv("TEST_MODE", "0").strip() == "1"
+RESET_CODE = os.getenv("RESET_CODE", "BRON-2026-RESET").strip()
 DB_PATH = os.getenv("DB_PATH", "complaints.sqlite3").strip()
 TZ_NAME = os.getenv("TZ", "Asia/Tashkent").strip()
-RESET_CODE = os.getenv("RESET_CODE", "BRON-2026-RESET").strip()
 
 TZ = ZoneInfo(TZ_NAME)
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is empty. Set Railway variable BOT_TOKEN.")
-if not GROUP_ID_RAW:
-    raise RuntimeError("GROUP_ID is empty. Set Railway variable GROUP_ID.")
-
-try:
-    GROUP_ID = int(GROUP_ID_RAW)
-except ValueError:
-    raise RuntimeError("GROUP_ID must be integer like -100....")
-
-ADMIN_IDS = set()
-for x in ADMIN_IDS_RAW.split(","):
-    x = x.strip()
-    if x.isdigit():
-        ADMIN_IDS.add(int(x))
-
-# ✅ Ходимлар 5 тага қисқарди
-EMPLOYEES = [
-    "Сагдуллаев Юнус",
+# Ходимлар: 5 та (сен айтганингдек). Истасанг env орқали ҳам берса бўлади.
+# Формат: EMPLOYEES="Сагдуллаев Юнус;Самадов Тулкин;Тохиров Муслимбек;Шерназаров Толиб;Рахаббоев Пулат"
+EMPLOYEES_ENV = os.getenv("EMPLOYEES", "").strip()
+if EMPLOYEES_ENV:
+    EMPLOYEES = [x.strip() for x in EMPLOYEES_ENV.split(";") if x.strip()]
+else:
+    EMPLOYEES = [
+        "Сагдуллаев Юнус",
     "Самадов Тулкин",
     "Тохиров Муслимбек",
     "Мустафоев Абдулло",
@@ -54,468 +45,499 @@ EMPLOYEES = [
     "Равшанов Зиёдулло",
     "Шерназаров Толиб",
     "Равшанов Охунжон",
-]
+    ]
 
+def parse_admin_ids(raw: str) -> set[int]:
+    out = set()
+    for part in re.split(r"[,\s]+", raw.strip()):
+        part = part.strip()
+        if part.isdigit():
+            out.add(int(part))
+    return out
 
-# ===================== LOGGING =====================
+ADMIN_IDS = parse_admin_ids(ADMIN_IDS_RAW)
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is empty. Set Railway variable BOT_TOKEN.")
+if not GROUP_ID_RAW:
+    raise RuntimeError("GROUP_ID is empty. Set Railway variable GROUP_ID (e.g. -100123...).")
+
+try:
+    GROUP_ID = int(GROUP_ID_RAW)
+except ValueError:
+    raise RuntimeError("GROUP_ID must be integer (e.g. -1001877019294).")
+
+if not ADMIN_IDS:
+    # сен биринчиси бўлиб қолсин деб, мажбурий қиляпман:
+    raise RuntimeError("ADMIN_IDS is empty. Set Railway variable ADMIN_IDS (your Telegram numeric id).")
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("nazorat-bot")
 
 
-# ===================== BOT / DP =====================
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
-rt = Router()
-dp.include_router(rt)
-
-scheduler = AsyncIOScheduler(timezone=TZ)
-
-
 # ===================== DB =====================
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def db() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
 
 def init_db():
-    with db() as con:
-        con.execute("""
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS complaints (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             employee TEXT NOT NULL,
-            from_user TEXT NOT NULL,
             from_user_id INTEGER NOT NULL,
+            from_user_name TEXT NOT NULL,
             text TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'new',   -- new/done/rejected
             created_at TEXT NOT NULL,
-            closed_at TEXT,
-            admin_action_by INTEGER
-        );
-        """)
-        con.execute("CREATE INDEX IF NOT EXISTS idx_emp ON complaints(employee);")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_status ON complaints(status);")
+            status TEXT NOT NULL DEFAULT 'NEW',  -- NEW / DONE / REJECT
+            decided_by INTEGER,
+            decided_at TEXT,
+            decision_note TEXT,
+            group_chat_id INTEGER,
+            group_message_id INTEGER
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_complaints_employee ON complaints(employee)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_complaints_status ON complaints(status)")
+    con.commit()
+    con.close()
 
-def now_str():
+def now_str() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
+def short_now() -> str:
+    return datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
 
-# ===================== HELPERS =====================
-def is_admin(uid: int) -> bool:
-    return uid in ADMIN_IDS
+def add_complaint(employee: str, from_user_id: int, from_user_name: str, text: str) -> int:
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO complaints(employee, from_user_id, from_user_name, text, created_at, status)
+        VALUES(?,?,?,?,?, 'NEW')
+    """, (employee, from_user_id, from_user_name, text, now_str()))
+    cid = cur.lastrowid
+    con.commit()
+    con.close()
+    return int(cid)
 
-def user_keyboard():
-    kb = ReplyKeyboardBuilder()
-    kb.button(text="📝 Янги шикоят")
-    kb.button(text="ℹ️ Ёрдам")
-    kb.adjust(1)
-    return kb.as_markup(resize_keyboard=True)
+def set_group_message(cid: int, chat_id: int, msg_id: int):
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        UPDATE complaints
+        SET group_chat_id=?, group_message_id=?
+        WHERE id=?
+    """, (chat_id, msg_id, cid))
+    con.commit()
+    con.close()
 
-def employee_kb(prefix: str):
+def get_complaint(cid: int):
+    con = db()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM complaints WHERE id=?", (cid,))
+    row = cur.fetchone()
+    con.close()
+    return row
+
+def update_status(cid: int, status: str, decided_by: int, note: str = ""):
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        UPDATE complaints
+        SET status=?, decided_by=?, decided_at=?, decision_note=?
+        WHERE id=?
+    """, (status, decided_by, now_str(), note, cid))
+    con.commit()
+    con.close()
+
+def stats():
+    con = db()
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(*) AS c FROM complaints")
+    total = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) AS c FROM complaints WHERE status='NEW'")
+    new = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) AS c FROM complaints WHERE status='DONE'")
+    done = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) AS c FROM complaints WHERE status='REJECT'")
+    rej = cur.fetchone()["c"]
+    con.close()
+    return total, new, done, rej
+
+def list_by_employee(employee: str, status: str | None = None, limit: int = 10, offset: int = 0):
+    con = db()
+    cur = con.cursor()
+    if status:
+        cur.execute("""
+            SELECT * FROM complaints
+            WHERE employee=? AND status=?
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+        """, (employee, status, limit, offset))
+    else:
+        cur.execute("""
+            SELECT * FROM complaints
+            WHERE employee=?
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+        """, (employee, limit, offset))
+    rows = cur.fetchall()
+    con.close()
+    return rows
+
+def count_by_employee(employee: str, status: str | None = None) -> int:
+    con = db()
+    cur = con.cursor()
+    if status:
+        cur.execute("SELECT COUNT(*) AS c FROM complaints WHERE employee=? AND status=?", (employee, status))
+    else:
+        cur.execute("SELECT COUNT(*) AS c FROM complaints WHERE employee=?", (employee,))
+    c = cur.fetchone()["c"]
+    con.close()
+    return int(c)
+
+def reset_all():
+    con = db()
+    cur = con.cursor()
+    cur.execute("DELETE FROM complaints")
+    cur.execute("DELETE FROM sqlite_sequence WHERE name='complaints'")
+    con.commit()
+    con.close()
+
+
+# ===================== UI helpers =====================
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+def fmt_user_name(m: Message) -> str:
+    # Ism фамилия бўлса — шуни оламиз
+    name = (m.from_user.full_name or "").strip() if m.from_user else ""
+    if not name:
+        name = "Unknown"
+    return name
+
+def admin_card(row) -> str:
+    # GROUP message format
+    # Сўзларни сен айтганингдек:
+    return (
+        "📌 <b>Янги шикоят</b>\n"
+        f"ID: <b>{row['id']}</b>\n"
+        f"Ходим: <b>{row['employee']}</b>\n"
+        f"Кимдан: <b>{row['from_user_name']}</b> | <code>{row['from_user_id']}</code>\n"
+        f"Вақт: <b>{datetime.fromisoformat(row['created_at']).astimezone(TZ).strftime('%d.%m.%Y %H:%M')}</b>\n\n"
+        f"<b>Шикоят мазмуни:</b>\n{escape_html(row['text'])}"
+    )
+
+def escape_html(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def kb_employee_select():
     kb = InlineKeyboardBuilder()
-    for i, name in enumerate(EMPLOYEES):
-        kb.button(text=name, callback_data=f"{prefix}:{i}")
+    for i, emp in enumerate(EMPLOYEES):
+        kb.button(text=emp, callback_data=f"emp:{i}")
     kb.adjust(1)
     return kb.as_markup()
 
-def complaint_actions_kb(cid: int):
-    # ✅ Бир хил кнопкалар: админда ҳам, гуруҳда ҳам чиқади
+def kb_admin_actions(cid: int):
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ DONE", callback_data=f"act:done:{cid}")
-    kb.button(text="❌ REJECT", callback_data=f"act:rej:{cid}")
+    kb.button(text="✅ Бартараф этилди", callback_data=f"done:{cid}")
+    kb.button(text="❌ Рад этилди", callback_data=f"reject:{cid}")
     kb.adjust(2)
     return kb.as_markup()
 
-def panel_kb():
+def kb_admin_panel_employees():
     kb = InlineKeyboardBuilder()
-    kb.button(text="👥 Ходим танлаш", callback_data="panel:employees")
-    kb.button(text="📊 Статистика", callback_data="panel:stats")
-    kb.button(text="🧹 BRON reset info", callback_data="panel:reset_info")
+    for i, emp in enumerate(EMPLOYEES):
+        kb.button(text=f"📂 {emp}", callback_data=f"panel_emp:{i}:0")
     kb.adjust(1)
     return kb.as_markup()
 
-def format_admin_card(row: sqlite3.Row) -> str:
-    return (
-        f"<b>Янги шикоят</b>\n"
-        f"ID: <code>{row['id']}</code>\n"
-        f"Ходим: <b>{row['employee']}</b>\n"
-        f"Кимдан: <b>{row['from_user']}</b> | <code>{row['from_user_id']}</code>\n"
-        f"Вақт: <b>{row['created_at']}</b>\n\n"
-        f"<b>Шикоят мазмуни:</b>\n{row['text']}"
-    )
-
-def psych_reject_text() -> str:
-    return (
-        "Шикоятингиз қабул қилинмади.\n"
-        "Илтимос, фактлар ва аниқ далиллар билан қайта юборинг. "
-        "Нотўғри маълумот юбориш назоратда қайд этилади."
-    )
-
-async def safe_send(chat_id: int, text: str, reply_markup=None):
-    try:
-        return await bot.send_message(chat_id, text, reply_markup=reply_markup)
-    except Exception as e:
-        log.warning("send_message error chat=%s: %s", chat_id, e)
-        return None
-
-async def notify_admins(text: str, reply_markup=None):
-    for aid in ADMIN_IDS:
-        await safe_send(aid, text, reply_markup=reply_markup)
-
-async def notify_group(text: str, reply_markup=None):
-    # ✅ гуруҳнинг ўзида ҳам кнопка бўлади
-    await safe_send(GROUP_ID, text, reply_markup=reply_markup)
+def kb_panel_pager(emp_index: int, page: int, total_pages: int):
+    kb = InlineKeyboardBuilder()
+    if page > 0:
+        kb.button(text="⬅️ Олдинги", callback_data=f"panel_emp:{emp_index}:{page-1}")
+    if page < total_pages - 1:
+        kb.button(text="Кейинги ➡️", callback_data=f"panel_emp:{emp_index}:{page+1}")
+    kb.button(text="🔙 Орқага", callback_data="panel_back")
+    kb.adjust(2, 1)
+    return kb.as_markup()
 
 
-# ===================== COMMANDS MENU =====================
-async def set_commands():
-    try:
-        await bot.set_my_commands([
-            ("start", "Ботни ишга тушириш"),
-            ("help", "Ёрдам"),
-            ("panel", "Админ панел (фақат админ)"),
-            ("stats", "Статистика (фақат админ)"),
-            ("ping", "Бот тирикми текшириш"),
-            ("bron", "BRON reset info (фақат админ)"),
-            ("reset", "BRON reset (фақат админ)"),
-        ])
-    except Exception as e:
-        log.warning("set_my_commands failed: %s", e)
+# ===================== Runtime state (simple) =====================
+@dataclass
+class Draft:
+    employee: str
+
+DRAFTS: dict[int, Draft] = {}  # user_id -> Draft
 
 
-# ===================== USER FLOW =====================
-USER_STATE = {}  # user_id -> {"step": "...", "employee": "..."}
+# ===================== Bot setup =====================
+rt = Router()
 
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
+dp = Dispatcher()
+dp.include_router(rt)
+
+
+# ===================== Commands =====================
 @rt.message(Command("start"))
 async def cmd_start(m: Message):
-    USER_STATE.pop(m.from_user.id, None)
-    await m.answer(
-        "Ассалому алайкум.\n"
-        "Бу — <b>Ishxona Nazorat Bot</b>.\n\n"
-        "Шикоят қолдириш учун <b>📝 Янги шикоят</b> тугмасини босинг.",
-        reply_markup=user_keyboard()
+    # меню командаларини Telegram’га тўғри ўтказиш учун
+    text = (
+        "Ассалом! 👋\n\n"
+        "Бу <b>Ishxona Nazorat Bot</b>.\n"
+        "Шикоят қолдириш учун аввал ходимни танланг, кейин матн ёзинг.\n\n"
+        "📌 Командалар:\n"
+        "• /panel — админ панель\n"
+        "• /stats — статистика\n"
+        "• /reset CODE — тозалаш (фақат админ)\n\n"
+        "Энг аввало ходимни танлаймиз 👇"
     )
+    await m.answer(text, reply_markup=kb_employee_select())
 
-@rt.message(Command("help"))
-@rt.message(F.text == "ℹ️ Ёрдам")
-async def cmd_help(m: Message):
-    await m.answer(
-        "Қоидалар:\n"
-        "1) Ходимни танланг\n"
-        "2) Шикоятни аниқ ва қисқа ёзинг\n\n"
-        "Админлар шикоятни кўриб чиқади."
-    )
-
-@rt.message(Command("ping"))
-async def cmd_ping(m: Message):
-    await m.answer("✅ Online")
-
-@rt.message(F.text == "📝 Янги шикоят")
-async def new_complaint(m: Message):
-    USER_STATE[m.from_user.id] = {"step": "pick_employee"}
-    await m.answer("Ким ҳақида шикоят? Ходимни танланг:", reply_markup=employee_kb("uemp"))
-
-@rt.callback_query(F.data.startswith("uemp:"))
-async def user_pick_employee(c: CallbackQuery):
-    uid = c.from_user.id
-    st = USER_STATE.get(uid)
-    if not st or st.get("step") != "pick_employee":
-        await c.answer("Қайтадан /start қилинг", show_alert=True)
-        return
-
-    idx = int(c.data.split(":")[1])
-    if idx < 0 or idx >= len(EMPLOYEES):
-        await c.answer("Хато танлов", show_alert=True)
-        return
-
-    emp = EMPLOYEES[idx]
-    USER_STATE[uid] = {"step": "enter_text", "employee": emp}
-    await c.message.edit_text(f"Ходим: <b>{emp}</b>\n\nЭнди <b>Шикоят мазмуни</b>ни ёзинг:")
-    await c.answer()
-
-@rt.message()
-async def user_text_router(m: Message):
-    uid = m.from_user.id
-    st = USER_STATE.get(uid)
-    if not st or st.get("step") != "enter_text":
-        return
-
-    text = (m.text or "").strip()
-    if len(text) < 3:
-        await m.answer("Шикоят жуда қисқа. Илтимос, тўлиқроқ ёзинг.")
-        return
-
-    employee = st["employee"]
-    from_user = (m.from_user.full_name or "NoName").strip()
-
-    with db() as con:
-        con.execute(
-            "INSERT INTO complaints(employee, from_user, from_user_id, text, status, created_at) VALUES(?,?,?,?,?,?)",
-            (employee, from_user, uid, text, "new", now_str())
-        )
-        cid = con.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
-        row = con.execute("SELECT * FROM complaints WHERE id=?", (cid,)).fetchone()
-
-    card = format_admin_card(row)
-
-    # ✅ Админга ҳам, гуруҳга ҳам тугмалар билан
-    await notify_admins(card, reply_markup=complaint_actions_kb(cid))
-    await notify_group(card, reply_markup=complaint_actions_kb(cid))
-
-    USER_STATE.pop(uid, None)
-    await m.answer("✅ Шикоят қабул қилинди. Раҳмат.", reply_markup=user_keyboard())
-
-
-# ===================== ADMIN PANEL =====================
 @rt.message(Command("panel"))
 async def cmd_panel(m: Message):
     if not is_admin(m.from_user.id):
-        return
-    await m.answer("Админ панел:", reply_markup=panel_kb())
+        return await m.answer("Бу бўлим фақат раҳбарият учун.")
+    await m.answer("📌 <b>Админ панель</b>\nҚайси ходим бўйича шикоятларни кўрамиз?", reply_markup=kb_admin_panel_employees())
+
+@rt.message(Command("admin"))
+async def cmd_admin_alias(m: Message):
+    # сен кўп ёзган /admin учун alias
+    await cmd_panel(m)
 
 @rt.message(Command("stats"))
 async def cmd_stats(m: Message):
     if not is_admin(m.from_user.id):
-        return
-    await m.answer(await build_stats_text())
-
-async def build_stats_text() -> str:
-    with db() as con:
-        total = con.execute("SELECT COUNT(*) AS n FROM complaints").fetchone()["n"]
-        new = con.execute("SELECT COUNT(*) AS n FROM complaints WHERE status='new'").fetchone()["n"]
-        done = con.execute("SELECT COUNT(*) AS n FROM complaints WHERE status='done'").fetchone()["n"]
-        rej = con.execute("SELECT COUNT(*) AS n FROM complaints WHERE status='rejected'").fetchone()["n"]
-
-    return (
-        "<b>📊 Статистика</b>\n"
+        return await m.answer("Бу бўлим фақат раҳбарият учун.")
+    total, new, done, rej = stats()
+    await m.answer(
+        "📊 <b>Статистика</b>\n"
         f"Жами: <b>{total}</b>\n"
         f"Янги: <b>{new}</b>\n"
-        f"Ёпилган: <b>{done}</b>\n"
-        f"Рад этилган: <b>{rej}</b>\n"
-    )
-
-@rt.callback_query(F.data == "panel:employees")
-async def panel_employees(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        await c.answer("No access", show_alert=True)
-        return
-    await c.message.edit_text("Ходимни танланг:", reply_markup=employee_kb("aemp"))
-    await c.answer()
-
-@rt.callback_query(F.data.startswith("aemp:"))
-async def admin_pick_employee(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        await c.answer("No access", show_alert=True)
-        return
-
-    idx = int(c.data.split(":")[1])
-    if idx < 0 or idx >= len(EMPLOYEES):
-        await c.answer("Хато", show_alert=True)
-        return
-
-    employee = EMPLOYEES[idx]
-    with db() as con:
-        rows = con.execute(
-            "SELECT * FROM complaints WHERE employee=? ORDER BY id DESC",
-            (employee,)
-        ).fetchall()
-
-    if not rows:
-        await c.message.edit_text(f"<b>{employee}</b> бўйича шикоят йўқ.", reply_markup=panel_kb())
-        await c.answer()
-        return
-
-    pos = 1
-    total = len(rows)
-    row = rows[pos - 1]
-
-    kb = InlineKeyboardBuilder()
-    if total > 1:
-        kb.button(text="➡️ Кейинги", callback_data=f"nav:next:{employee}:{pos}")
-    kb.button(text="🔙 Панел", callback_data="panel:back")
-    kb.adjust(2)
-
-    await c.message.edit_text(
-        format_admin_card(row) + f"\n\n({pos}/{total})",
-        reply_markup=kb.as_markup()
-    )
-    await c.answer()
-
-@rt.callback_query(F.data.startswith("nav:"))
-async def admin_nav(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        await c.answer("No access", show_alert=True)
-        return
-
-    _, direction, employee, pos_s = c.data.split(":", 3)
-    pos = int(pos_s)
-
-    with db() as con:
-        rows = con.execute(
-            "SELECT * FROM complaints WHERE employee=? ORDER BY id DESC",
-            (employee,)
-        ).fetchall()
-
-    total = len(rows)
-    if total == 0:
-        await c.message.edit_text("Шикоятлар топилмади.", reply_markup=panel_kb())
-        await c.answer()
-        return
-
-    if direction == "prev":
-        pos = max(1, pos - 1)
-    elif direction == "next":
-        pos = min(total, pos + 1)
-
-    row = rows[pos - 1]
-
-    kb = InlineKeyboardBuilder()
-    if pos > 1:
-        kb.button(text="⬅️ Олдинги", callback_data=f"nav:prev:{employee}:{pos}")
-    if pos < total:
-        kb.button(text="➡️ Кейинги", callback_data=f"nav:next:{employee}:{pos}")
-    kb.button(text="🔙 Панел", callback_data="panel:back")
-    kb.adjust(2)
-
-    await c.message.edit_text(
-        format_admin_card(row) + f"\n\n({pos}/{total})",
-        reply_markup=kb.as_markup()
-    )
-    await c.answer()
-
-@rt.callback_query(F.data == "panel:stats")
-async def panel_stats(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        await c.answer("No access", show_alert=True)
-        return
-    await c.message.edit_text(await build_stats_text(), reply_markup=panel_kb())
-    await c.answer()
-
-@rt.callback_query(F.data == "panel:reset_info")
-async def panel_reset_info(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        await c.answer("No access", show_alert=True)
-        return
-    await c.message.edit_text(
-        "🧹 <b>База тозалаш + рестарт</b>\n\n"
-        "Ишлатиш:\n"
-        f"<code>/reset {RESET_CODE}</code>\n\n"
-        "⚠️ Барча маълумот ўчади ва Railway ботни қайта ишга туширади.",
-        reply_markup=panel_kb()
-    )
-    await c.answer()
-
-@rt.callback_query(F.data == "panel:back")
-async def panel_back(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        await c.answer("No access", show_alert=True)
-        return
-    await c.message.edit_text("Админ панел:", reply_markup=panel_kb())
-    await c.answer()
-
-
-# ===================== ACTIONS (DONE / REJECT) =====================
-@rt.callback_query(F.data.startswith("act:"))
-async def admin_action(c: CallbackQuery):
-    # ✅ ким босса ҳам фақат админ ишлайди (гуруҳда ҳам)
-    if not is_admin(c.from_user.id):
-        await c.answer("❌ Бу тугмалар фақат админ учун.", show_alert=True)
-        return
-
-    _, action, cid_s = c.data.split(":")
-    cid = int(cid_s)
-
-    with db() as con:
-        row = con.execute("SELECT * FROM complaints WHERE id=?", (cid,)).fetchone()
-        if not row:
-            await c.answer("Топилмади", show_alert=True)
-            return
-
-        if action == "done":
-            con.execute(
-                "UPDATE complaints SET status='done', closed_at=?, admin_action_by=? WHERE id=?",
-                (now_str(), c.from_user.id, cid)
-            )
-            # постни белгилаб қўямиз
-            await c.message.edit_text(format_admin_card(row) + "\n\n✅ <b>Ёпилди (DONE)</b>")
-            await c.answer("✅ DONE", show_alert=True)
-            return
-
-        if action == "rej":
-            con.execute(
-                "UPDATE complaints SET status='rejected', closed_at=?, admin_action_by=? WHERE id=?",
-                (now_str(), c.from_user.id, cid)
-            )
-            # шикоятчига психологик рад
-            try:
-                await bot.send_message(row["from_user_id"], psych_reject_text())
-            except Exception as e:
-                log.warning("reject notify user failed: %s", e)
-
-            await c.message.edit_text(format_admin_card(row) + "\n\n❌ <b>Рад этилди (REJECT)</b>")
-            await c.answer("❌ REJECT", show_alert=True)
-            return
-
-    await c.answer("OK")
-
-
-# ===================== BRON RESET =====================
-@rt.message(Command("bron"))
-async def cmd_bron(m: Message):
-    if not is_admin(m.from_user.id):
-        return
-    await m.answer(
-        "🧹 <b>BRON reset</b>\n\n"
-        "Барча шикоятларни 0 дан бошлаш ва ботни қайта ишга тушириш учун:\n"
-        f"<code>/reset {RESET_CODE}</code>\n\n"
-        "⚠️ Фақат админда ишлайди."
+        f"Бартараф этилди: <b>{done}</b>\n"
+        f"Рад этилди: <b>{rej}</b>\n"
+        f"\nТест режим: <b>{'ON' if TEST_MODE else 'OFF'}</b>"
     )
 
 @rt.message(Command("reset"))
 async def cmd_reset(m: Message):
     if not is_admin(m.from_user.id):
-        return
-    parts = (m.text or "").strip().split(maxsplit=1)
-    if len(parts) != 2 or parts[1].strip() != RESET_CODE:
-        await m.answer("❌ BRON код нотўғри.")
-        return
+        return await m.answer("Бу бўлим фақат раҳбарият учун.")
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return await m.answer("Формат: <code>/reset BRON-CODE</code>")
+    code = parts[1].strip()
+    if code != RESET_CODE:
+        return await m.answer("❌ Код нотўғри. (Reset рад этилди)")
+    reset_all()
+    await m.answer("✅ База тозаланди. Энди ҳаммаси 0 дан бошланади.")
 
+
+# ===================== Callbacks: employee choose =====================
+@rt.callback_query(F.data.startswith("emp:"))
+async def cb_emp(c: CallbackQuery):
+    idx = int(c.data.split(":")[1])
+    employee = EMPLOYEES[idx]
+    DRAFTS[c.from_user.id] = Draft(employee=employee)
+    await c.message.answer(
+        f"✅ Танланди: <b>{employee}</b>\n\n"
+        "Энди шикоят матнини ёзинг.\n"
+        "Масалан: <i>\"2299 ракамли перемещение хато\"</i>"
+    )
+    await c.answer()
+
+# ===================== Receive complaint text =====================
+@rt.message(F.text)
+async def any_text(m: Message):
+    # Команда эмас бўлса ва draft бор бўлса — шикоят деб қабул қиламиз
+    if not m.from_user:
+        return
+    if (m.text or "").startswith("/"):
+        return  # командаларни алоҳида handler ушлайди
+    d = DRAFTS.get(m.from_user.id)
+    if not d:
+        # user ўзи билмай ёзиб юборса — қайта йўналтирамиз
+        return await m.answer("Ходимни танланг 👇", reply_markup=kb_employee_select())
+
+    text = (m.text or "").strip()
+    if len(text) < 3:
+        return await m.answer("Матн жуда қисқа. Илтимос, аниқроқ ёзинг.")
+
+    from_name = fmt_user_name(m)
+    cid = add_complaint(d.employee, m.from_user.id, from_name, text)
+
+    # groupga yuboramiz
+    row = get_complaint(cid)
+    msg = await bot.send_message(
+        chat_id=GROUP_ID,
+        text=admin_card(row),
+        reply_markup=kb_admin_actions(cid),
+    )
+    set_group_message(cid, GROUP_ID, msg.message_id)
+
+    # userga tasdiq
+    await m.answer("✅ Қабул қилинди. Раҳбарият кўриб чиқади.")
+    # draft tugadi
+    DRAFTS.pop(m.from_user.id, None)
+
+
+# ===================== Admin actions: DONE / REJECT =====================
+async def notify_user_reject(user_id: int):
+    # Психологик юмшоқ, қисқа
+    text = (
+        "✅ Мурожаатингиз кўриб чиқилди.\n"
+        "Ҳозирча бу масала бўйича қўшимча далил/аниқлик керак бўлди, шу сабаб рад этилди.\n"
+        "Истасангиз, фактлар/расм/скрин билан қайта юборинг — албатта кўриб чиқилади."
+    )
     try:
-        if os.path.exists(DB_PATH):
-            os.remove(DB_PATH)
-        init_db()
-    except Exception as e:
-        await m.answer(f"❌ DB ўчиришда хато: {e}")
+        await bot.send_message(user_id, text)
+    except Exception:
+        pass
+
+@rt.callback_query(F.data.startswith("done:"))
+async def cb_done(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer("Рухсат йўқ", show_alert=True)
+    cid = int(c.data.split(":")[1])
+    row = get_complaint(cid)
+    if not row:
+        return await c.answer("Топилмади", show_alert=True)
+
+    if row["status"] != "NEW":
+        return await c.answer("Аллақачон қарор қилинган", show_alert=True)
+
+    update_status(cid, "DONE", c.from_user.id, "")
+    row2 = get_complaint(cid)
+
+    # group message edit
+    try:
+        await c.message.edit_text(admin_card(row2) + "\n\n✅ <b>Бартараф этилди</b>")
+    except Exception:
+        pass
+
+    await c.answer("OK ✅")
+
+@rt.callback_query(F.data.startswith("reject:"))
+async def cb_reject(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer("Рухсат йўқ", show_alert=True)
+    cid = int(c.data.split(":")[1])
+    row = get_complaint(cid)
+    if not row:
+        return await c.answer("Топилмади", show_alert=True)
+
+    if row["status"] != "NEW":
+        return await c.answer("Аллақачон қарор қилинган", show_alert=True)
+
+    update_status(cid, "REJECT", c.from_user.id, "")
+    row2 = get_complaint(cid)
+
+    # group message edit
+    try:
+        await c.message.edit_text(admin_card(row2) + "\n\n❌ <b>Рад этилди</b>")
+    except Exception:
+        pass
+
+    # notify user softly
+    await notify_user_reject(int(row2["from_user_id"]))
+    await c.answer("OK ❌")
+
+
+# ===================== Admin panel callbacks =====================
+@rt.callback_query(F.data == "panel_back")
+async def cb_panel_back(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer("Рухсат йўқ", show_alert=True)
+    await c.message.edit_text("📌 <b>Админ панель</b>\nҚайси ходим бўйича шикоятларни кўрамиз?", reply_markup=kb_admin_panel_employees())
+    await c.answer()
+
+@rt.callback_query(F.data.startswith("panel_emp:"))
+async def cb_panel_emp(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer("Рухсат йўқ", show_alert=True)
+
+    _, idx_s, page_s = c.data.split(":")
+    emp_index = int(idx_s)
+    page = int(page_s)
+    employee = EMPLOYEES[emp_index]
+
+    per_page = 5
+    total = count_by_employee(employee)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    rows = list_by_employee(employee, status=None, limit=per_page, offset=page * per_page)
+
+    lines = [f"📂 <b>{employee}</b>\nЖами шикоят: <b>{total}</b>\nСаҳифа: <b>{page+1}/{total_pages}</b>\n"]
+    if not rows:
+        lines.append("Ҳали шикоят йўқ.")
+    else:
+        for r in rows:
+            status = r["status"]
+            st = "🆕 NEW" if status == "NEW" else ("✅ DONE" if status == "DONE" else "❌ REJECT")
+            created = datetime.fromisoformat(r["created_at"]).astimezone(TZ).strftime("%d.%m %H:%M")
+            # 1 қаторасига қисқартириб:
+            preview = (r["text"] or "").strip().replace("\n", " ")
+            if len(preview) > 80:
+                preview = preview[:80] + "…"
+            lines.append(
+                f"\n<b>ID {r['id']}</b> | {st} | <i>{created}</i>\n"
+                f"Кимдан: <code>{r['from_user_id']}</code>\n"
+                f"Мазмун: {escape_html(preview)}"
+            )
+
+    await c.message.edit_text(
+        "\n".join(lines),
+        reply_markup=kb_panel_pager(emp_index, page, total_pages),
+    )
+    await c.answer()
+
+
+# ===================== Scheduler: 2 soat + alertlar =====================
+async def heartbeat():
+    # Тест учун: админга “бот тирик” деган хабар (TEST_MODE=1 бўлса)
+    if not TEST_MODE:
         return
-
-    await m.answer("✅ База тозаланди. Бот ҳозир қайта ишга тушади.")
-    await asyncio.sleep(0.8)
-    raise SystemExit("BRON reset triggered")
-
-
-# ===================== SCHEDULED ALERTS =====================
-async def alert_0730():
-    await notify_admins("✅ Bot online (07:30 текширув)")
-    if TEST_MODE:
-        await notify_admins("🧪 TEST_MODE=1: 07:30 тест сигнали")
-
-async def alert_1930():
-    await notify_admins("✅ Bot online (19:30 текширув)")
-    if TEST_MODE:
-        await notify_admins("🧪 TEST_MODE=1: 19:30 тест сигнали")
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, f"🟢 Bot online (heartbeat) — {short_now()}")
+        except Exception:
+            pass
 
 def setup_scheduler():
-    scheduler.add_job(alert_0730, "cron", hour=7, minute=30)
-    scheduler.add_job(alert_1930, "cron", hour=19, minute=30)
+    sch = AsyncIOScheduler(timezone=TZ)
+    # сен айтган “иккала соат” — 07:30 ва 19:30 (TEST_MODE да ишлатиш учун)
+    sch.add_job(lambda: asyncio.create_task(heartbeat()), "cron", hour=7, minute=30)
+    sch.add_job(lambda: asyncio.create_task(heartbeat()), "cron", hour=19, minute=30)
+    sch.start()
 
 
-# ===================== MAIN =====================
+# ===================== Main =====================
+async def set_commands():
+    # /startда командалар чиқиши учун Telegram менюга қўямиз
+    from aiogram.types import BotCommand
+    cmds = [
+        BotCommand(command="start", description="Ботни ишга тушириш / ходим танлаш"),
+        BotCommand(command="panel", description="Админ панель (ходимлар бўйича)"),
+        BotCommand(command="stats", description="Статистика"),
+        BotCommand(command="reset", description="Тозалаш (фақат админ)"),
+    ]
+    try:
+        await bot.set_my_commands(cmds)
+    except Exception as e:
+        log.warning("set_my_commands failed: %r", e)
+
 async def main():
     init_db()
-    await set_commands()
     setup_scheduler()
-    scheduler.start()
-
-    log.info("Bot started. TEST_MODE=%s", TEST_MODE)
+    await set_commands()
+    log.info("Bot started.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
