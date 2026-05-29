@@ -16,6 +16,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from yordamchi_push import push_to_yordamchi_hub_background
+
 
 # ===================== CONFIG (Railway env) =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8381505129:AAG0X7jwRHUScfwFrsxi5C5QTwGuwfn3RIE").strip()
@@ -376,6 +378,13 @@ async def any_text(m: Message):
         reply_markup=kb_admin_actions(cid),
     )
     set_group_message(cid, GROUP_ID, msg.message_id)
+
+    preview = text[:140].replace("\n", " ")
+    push_to_yordamchi_hub_background(
+        tg_id=m.from_user.id,
+        bot_key="ishxona",
+        summary=f"Shikoyat ({d.employee}): {preview}",
+    )
 
     await m.answer("✅ Қабул қилинди. Раҳбарият кўриб чиқади.")
     DRAFTS.pop(m.from_user.id, None)
