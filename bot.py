@@ -16,6 +16,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from hub_test import BTN_HUB_TEST, handle_admin_hub_test
 from yordamchi_push import push_to_yordamchi_hub_background
 
 
@@ -298,10 +299,24 @@ async def cmd_start(m: Message):
         "📌 Командалар:\n"
         "• /panel — админ панель\n"
         "• /stats — статистика\n"
-        "• /reset CODE — тозалаш (фақат админ)\n\n"
+        "• /reset CODE — тозалаш (фақат админ)\n"
+        "• /test_hub — hub test (фақат админ)\n\n"
         "Энг аввало ходимни танлаймиз 👇"
     )
-    await m.answer(text, reply_markup=kb_employee_select())
+    extra = ""
+    if is_admin(m.from_user.id):
+        extra = f"\n\nAdmin: <code>/test_hub</code> yoki «{BTN_HUB_TEST}»"
+    await m.answer(text + extra, reply_markup=kb_employee_select())
+
+@rt.message(Command("test_hub"))
+async def cmd_test_hub(m: Message):
+    await handle_admin_hub_test(m)
+
+
+@rt.message(F.text == BTN_HUB_TEST)
+async def btn_test_hub(m: Message):
+    await handle_admin_hub_test(m)
+
 
 @rt.message(Command("panel"))
 async def cmd_panel(m: Message):
@@ -359,6 +374,8 @@ async def cb_emp(c: CallbackQuery):
 @rt.message(F.text, F.chat.type == "private")
 async def any_text(m: Message):
     if not m.from_user:
+        return
+    if m.text == BTN_HUB_TEST:
         return
     d = DRAFTS.get(m.from_user.id)
     if not d:
@@ -527,6 +544,7 @@ async def set_commands():
         BotCommand(command="panel", description="Админ панель (ходимлар бўйича)"),
         BotCommand(command="stats", description="Статистика"),
         BotCommand(command="reset", description="Тозалаш (фақат админ)"),
+        BotCommand(command="test_hub", description="Hub test (faqat admin)"),
         BotCommand(command="whoami", description="ID ва admin текшириш"),
         BotCommand(command="factory_reset", description="Тўлиқ reset + restart (фақат админ)"),
     ]
