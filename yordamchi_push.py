@@ -13,10 +13,15 @@ from zoneinfo import ZoneInfo
 
 log = logging.getLogger(__name__)
 
-HUB_URL = os.getenv("YORDAMCHI_HUB_URL", "").strip().rstrip("/")
-HUB_SECRET = os.getenv("YORDAMCHI_HUB_SECRET", "").strip()
-TG_BOT_TOKEN = os.getenv("YORDAMCHI_BOT_TOKEN", "").strip()
-INGEST_CHAT_ID = int(os.getenv("YORDAMCHI_INGEST_CHAT_ID", "0") or "0")
+HUB_URL = (os.getenv("YORDAMCHI_HUB_URL", "").strip() or os.getenv("HUB_URL", "").strip()).rstrip("/")
+HUB_SECRET = (
+    os.getenv("YORDAMCHI_HUB_SECRET", "").strip()
+    or os.getenv("HUB_SECRET", "").strip()
+)
+TG_BOT_TOKEN = os.getenv("YORDAMCHI_BOT_TOKEN", "").strip() or os.getenv("BOT_TOKEN", "").strip()
+INGEST_CHAT_ID = int(
+    (os.getenv("YORDAMCHI_INGEST_CHAT_ID", "").strip() or os.getenv("INGEST_CHAT_ID", "0").strip() or "0")
+)
 TZ = ZoneInfo(os.getenv("TZ", "Asia/Tashkent"))
 
 
@@ -39,7 +44,11 @@ def _post_http(payload: dict) -> bool:
     req = urllib.request.Request(
         f"{HUB_URL}/ingest",
         data=body,
-        headers={"Content-Type": "application/json", "X-Hub-Secret": HUB_SECRET},
+        headers={
+            "Content-Type": "application/json",
+            "X-Hub-Secret": HUB_SECRET,
+            "Authorization": f"Bearer {HUB_SECRET}",
+        },
         method="POST",
     )
     try:
@@ -76,7 +85,7 @@ def _post_telegram(day: str, tg_id: int, bot_key: str, summary: str) -> bool:
 
 def _send_sync(payload: dict, day: str, tg_id: int, bot_key: str, summary: str) -> tuple[bool, str]:
     if not hub_configured():
-        return False, "Hub sozlanmagan"
+        return False, "Hub sozlanmagan (URL/SECRET yoki BOT_TOKEN/INGEST_CHAT_ID yo'q)"
     if _post_http(payload):
         return True, "HTTP"
     if _post_telegram(day, tg_id, bot_key, summary):
