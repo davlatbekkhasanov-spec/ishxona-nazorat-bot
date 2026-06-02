@@ -25,7 +25,10 @@ GROUP_ID_RAW = os.getenv("GROUP_ID", "-1001877019294").strip()
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "1432810519").strip()
 TEST_MODE = os.getenv("TEST_MODE", "0").strip() == "1"
 RESET_CODE = os.getenv("RESET_CODE", "BRON-2026-RESET").strip()
-DB_PATH = os.getenv("DB_PATH", "complaints.sqlite3").strip()
+DB_PATH = os.getenv("DB_PATH", "/data/complaints.sqlite3").strip() or "/data/complaints.sqlite3"
+_db_dir = os.path.dirname(DB_PATH)
+if _db_dir:
+    os.makedirs(_db_dir, exist_ok=True)
 TZ_NAME = os.getenv("TZ", "Asia/Tashkent").strip()
 
 TZ = ZoneInfo(TZ_NAME)
