@@ -16,7 +16,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from yordamchi_push import push_to_yordamchi_hub_background
+from yordamchi_push import push_to_yordamchi_hub, push_to_yordamchi_hub_background, today_iso
 
 
 # ===================== CONFIG (Railway env) =====================
@@ -603,6 +603,31 @@ async def cmd_factory_reset(m: Message):
 # ===================== Main =====================
 async def main():
     init_db()
+    try:
+        day = today_iso()
+        con = db()
+        rows = con.execute(
+            """
+            SELECT from_user_id, COUNT(*) AS cnt
+            FROM complaints
+            WHERE created_at LIKE ?
+            GROUP BY from_user_id
+            """,
+            (f"{day}%",),
+        ).fetchall()
+        con.close()
+        for r in rows:
+            uid = int(r["from_user_id"] or 0)
+            cnt = int(r["cnt"] or 0)
+            if uid and cnt > 0:
+                await push_to_yordamchi_hub(
+                    tg_id=uid,
+                    bot_key="ishxona",
+                    summary=f"Ishxona (bugun jami): shikoyat {cnt}",
+                    day_iso=day,
+                )
+    except Exception:
+        log.exception("ishxona hub backfill xato")
     setup_scheduler()
     await set_commands()
     log.info("Bot started.")
