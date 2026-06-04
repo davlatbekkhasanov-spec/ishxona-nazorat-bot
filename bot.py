@@ -44,7 +44,7 @@ else:
     "Самадов Тулкин",
     "Тохиров Муслимбек",
     "Мустафоев Абдулло",
-    "Ражаббоев Пулат",
+    "Tuvalov Farrux",
     "Рузибоев Сардор",
     "Собиров Самандар",
     "Равшанов Зиёдулло",
@@ -112,6 +112,78 @@ def init_db():
 
 def now_str() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+# Yordamchi hub — xodim Telegram ID (davlat-yordamchi bilan bir xil)
+EMPLOYEE_TG_IDS: dict[str, int] = {
+    "Сагдуллаев Юнус": 6991673998,
+    "Sagdullaev Yunus": 6991673998,
+    "Самадов Тулкин": 6001619806,
+    "Samadov To'lqin": 6001619806,
+    "Тохиров Муслимбек": 5732350707,
+    "Toxirov Muslimbek": 5732350707,
+    "Мустафоев Абдулло": 6931958983,
+    "Mustafoev Abdullo": 6931958983,
+    "Рузибоев Синдор": 8547365654,
+    "Ruziboev Sindor": 8547365654,
+    "Равшанов Зиёдулло": 8440127425,
+    "Ravshanov Ziyodullo": 8440127425,
+    "Шерназаров Толиб": 5465963344,
+    "Shernazarov Tolib": 5465963344,
+    "Равшанов Охунжон": 5412958249,
+    "Ravshanov Oxunjon": 5412958249,
+    "Tuvalov Farrux": 8472656729,
+    "Тувалов Фаррух": 8472656729,
+    "Rajabboev Pulat": 8472656729,
+}
+
+
+def employee_tg_id(employee: str) -> int | None:
+    e = (employee or "").strip()
+    if e in EMPLOYEE_TG_IDS:
+        return int(EMPLOYEE_TG_IDS[e])
+    low = e.lower()
+    for name, tid in EMPLOYEE_TG_IDS.items():
+        if name.lower() == low:
+            return int(tid)
+    return None
+
+
+def complaint_counts_for_day(employee: str, day_iso: str) -> tuple[int, int, int]:
+    """(ochiq NEW, yopilgan DONE, rad REJECT) — shu kun."""
+    con = db()
+    rows = con.execute(
+        """
+        SELECT status, COUNT(*) AS cnt FROM complaints
+        WHERE employee = ? AND created_at LIKE ?
+        GROUP BY status
+        """,
+        (employee, f"{day_iso}%"),
+    ).fetchall()
+    con.close()
+    ochiq = done = rad = 0
+    for r in rows:
+        st = (r["status"] or "").upper()
+        c = int(r["cnt"] or 0)
+        if st == "NEW":
+            ochiq = c
+        elif st == "DONE":
+            done = c
+        elif st == "REJECT":
+            rad = c
+    return ochiq, done, rad
+
+
+async def sync_employee_hub(employee: str, day_iso: str | None = None) -> None:
+    """Hub ga ochiq shikoyatlar — bartaraf/rad ochko bermaydi."""
+    tid = employee_tg_id(employee)
+    if not tid:
+        log.warning("Hub: tg_id topilmadi: %s", employee)
+        return
+    day = day_iso or today_iso()
+    ochiq, done, rad = complaint_counts_for_day(employee, day)
+    summary = f"Ishxona: ochiq={ochiq}, yopilgan={done}, rad={rad}"
+    await push_to_yordamchi_hub(tg_id=tid, bot_key="ishxona", summary=summary, day_iso=day)
 
 def short_now() -> str:
     return datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
@@ -382,12 +454,7 @@ async def any_text(m: Message):
     )
     set_group_message(cid, GROUP_ID, msg.message_id)
 
-    preview = text[:140].replace("\n", " ")
-    push_to_yordamchi_hub_background(
-        tg_id=m.from_user.id,
-        bot_key="ishxona",
-        summary=f"Shikoyat ({d.employee}): {preview}",
-    )
+    await sync_employee_hub(d.employee)
 
     await m.answer("✅ Қабул қилинди. Раҳбарият кўриб чиқади.")
     DRAFTS.pop(m.from_user.id, None)
@@ -426,6 +493,7 @@ async def cb_done(c: CallbackQuery):
     except Exception:
         pass
 
+    await sync_employee_hub(row2["employee"])
     await c.answer("OK ✅")
 
 @rt.callback_query(F.data.startswith("reject:"))
@@ -451,6 +519,7 @@ async def cb_reject(c: CallbackQuery):
 
     # notify user softly
     await notify_user_reject(int(row2["from_user_id"]))
+    await sync_employee_hub(row2["employee"])
     await c.answer("OK ❌")
 
 
@@ -605,27 +674,9 @@ async def main():
     init_db()
     try:
         day = today_iso()
-        con = db()
-        rows = con.execute(
-            """
-            SELECT from_user_id, COUNT(*) AS cnt
-            FROM complaints
-            WHERE created_at LIKE ?
-            GROUP BY from_user_id
-            """,
-            (f"{day}%",),
-        ).fetchall()
-        con.close()
-        for r in rows:
-            uid = int(r["from_user_id"] or 0)
-            cnt = int(r["cnt"] or 0)
-            if uid and cnt > 0:
-                await push_to_yordamchi_hub(
-                    tg_id=uid,
-                    bot_key="ishxona",
-                    summary=f"Ishxona (bugun jami): shikoyat {cnt}",
-                    day_iso=day,
-                )
+        for emp in EMPLOYEES:
+            if employee_tg_id(emp):
+                await sync_employee_hub(emp, day_iso=day)
     except Exception:
         log.exception("ishxona hub backfill xato")
     setup_scheduler()
