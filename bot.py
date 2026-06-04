@@ -45,6 +45,7 @@ else:
     "Тохиров Муслимбек",
     "Мустафоев Абдулло",
     "Tuvalov Farrux",
+    "Тувалов Фаррух",
     "Рузибоев Сардор",
     "Собиров Самандар",
     "Равшанов Зиёдулло",
@@ -114,39 +115,14 @@ def now_str() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
+from employee_registry import build_employee_tg_ids_dict, resolve_employee_tg_id
+
 # Yordamchi hub — xodim Telegram ID (davlat-yordamchi bilan bir xil)
-EMPLOYEE_TG_IDS: dict[str, int] = {
-    "Сагдуллаев Юнус": 6991673998,
-    "Sagdullaev Yunus": 6991673998,
-    "Самадов Тулкин": 6001619806,
-    "Samadov To'lqin": 6001619806,
-    "Тохиров Муслимбек": 5732350707,
-    "Toxirov Muslimbek": 5732350707,
-    "Мустафоев Абдулло": 6931958983,
-    "Mustafoev Abdullo": 6931958983,
-    "Рузибоев Синдор": 8547365654,
-    "Ruziboev Sindor": 8547365654,
-    "Равшанов Зиёдулло": 8440127425,
-    "Ravshanov Ziyodullo": 8440127425,
-    "Шерназаров Толиб": 5465963344,
-    "Shernazarov Tolib": 5465963344,
-    "Равшанов Охунжон": 5412958249,
-    "Ravshanov Oxunjon": 5412958249,
-    "Tuvalov Farrux": 8472656729,
-    "Тувалов Фаррух": 8472656729,
-    "Rajabboev Pulat": 8472656729,
-}
+EMPLOYEE_TG_IDS: dict[str, int] = build_employee_tg_ids_dict()
 
 
 def employee_tg_id(employee: str) -> int | None:
-    e = (employee or "").strip()
-    if e in EMPLOYEE_TG_IDS:
-        return int(EMPLOYEE_TG_IDS[e])
-    low = e.lower()
-    for name, tid in EMPLOYEE_TG_IDS.items():
-        if name.lower() == low:
-            return int(tid)
-    return None
+    return resolve_employee_tg_id(employee)
 
 
 def complaint_counts_for_day(employee: str, day_iso: str) -> tuple[int, int, int]:
