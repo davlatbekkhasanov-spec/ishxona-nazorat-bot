@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-TUVALOV_FARRUX_TG_ID = 8472656729
+TUVALOV_FARRUX_TG_ID = 7703650930
 CANONICAL_TUVALOV = "Tuvalov Farrux"
 
 PULAT_LEGACY_NAMES: frozenset[str] = frozenset(
