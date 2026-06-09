@@ -18,6 +18,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from yordamchi_push import push_to_yordamchi_hub, push_to_yordamchi_hub_background, today_iso
 
+from persist_data import bootstrap_persistence, persistence_status_line, resolve_db_path
 
 # ===================== CONFIG (Railway env) =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8381505129:AAG0X7jwRHUScfwFrsxi5C5QTwGuwfn3RIE").strip()
@@ -25,10 +26,11 @@ GROUP_ID_RAW = os.getenv("GROUP_ID", "-1001877019294").strip()
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "1432810519").strip()
 TEST_MODE = os.getenv("TEST_MODE", "0").strip() == "1"
 RESET_CODE = os.getenv("RESET_CODE", "BRON-2026-RESET").strip()
-DB_PATH = os.getenv("DB_PATH", "/data/complaints.sqlite3").strip() or "/data/complaints.sqlite3"
-_db_dir = os.path.dirname(DB_PATH)
-if _db_dir:
-    os.makedirs(_db_dir, exist_ok=True)
+_DB_BOOT = bootstrap_persistence(
+    resolve_db_path(default_filename="complaints.sqlite3"),
+    legacy_names=("complaints.sqlite3",),
+)
+DB_PATH = _DB_BOOT["db_path"]
 TZ_NAME = os.getenv("TZ", "Asia/Tashkent").strip()
 
 TZ = ZoneInfo(TZ_NAME)
@@ -647,6 +649,7 @@ async def cmd_factory_reset(m: Message):
 
 # ===================== Main =====================
 async def main():
+    log.info(persistence_status_line(DB_PATH))
     init_db()
     try:
         day = today_iso()
